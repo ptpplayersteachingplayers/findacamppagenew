@@ -1,0 +1,3195 @@
+/**
+ * Plugin Name: PTP Camp Finder
+ * Description: Find a Camp page with hero section, Google Maps, and WooCommerce product list view
+ * Version: 1.3.0
+ * Author: Players Teaching Players
+ * Text Domain: ptp-camp-finder
+ * Requires at least: 5.0
+ * Tested up to: 6.4
+ * Requires PHP: 8.1
+ * WC requires at least: 5.0
+ * WC tested up to: 8.5
+ * 
+ * Changelog:
+ * 1.2.0 - Refactored to use native WooCommerce methods (wc_get_products), improved product queries, cleaner code
+ * 1.1.0 - Added video controls (play/pause, sound toggle), mobile optimizations, AJAX fallback for REST API, improved error handling
+ * 1.0.0 - Initial release with hero section, Google Maps integration, and camp list view
+ */
+
+// Prevent direct access
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// Check if WooCommerce is active
+add_action('admin_init', 'ptp_camp_finder_check_woocommerce');
+function ptp_camp_finder_check_woocommerce() {
+    if (!class_exists('WooCommerce')) {
+        add_action('admin_notices', 'ptp_camp_finder_woocommerce_notice');
+    }
+}
+
+function ptp_camp_finder_woocommerce_notice() {
+    echo '<div class="notice notice-error"><p><strong>PTP Camp Finder</strong> requires WooCommerce to be installed and activated.</p></div>';
+}
+
+class PTP_Camp_Finder {
+    
+    private $version = '1.3.0';
+    private $api_key_option = 'ptp_google_maps_api_key';
+    private $default_api_key = 'AIzaSyASLf8mjb8iEbVo99DnaaPzXGlu5jhXrZE';
+    private $cache_group = 'ptp_camp_finder';
+    private $cache_expiry = 3600; // 1 hour
+    
+    public function __construct() {
+        add_action('init', [$this, 'init']);
+        add_action('wp_enqueue_scripts', [$this, 'enqueue_scripts'], 20);
+        add_action('wp_head', [$this, 'add_seo_meta']);
+        
+        // Register REST routes early and on multiple hooks to ensure they're available
+        add_action('rest_api_init', [$this, 'register_rest_routes'], 10);
+        add_action('init', [$this, 'register_rest_routes_early'], 5);
+        
+        add_action('wp_ajax_ptp_load_camps', [$this, 'ajax_load_camps']);
+        add_action('wp_ajax_nopriv_ptp_load_camps', [$this, 'ajax_load_camps']);
+        
+        // AJAX fallback for map pins (if REST API doesn't work)
+        // AJAX endpoints - both logged in and public
+        add_action('wp_ajax_ptp_get_map_pins', [$this, 'ajax_get_map_pins']);
+        add_action('wp_ajax_nopriv_ptp_get_map_pins', [$this, 'ajax_get_map_pins_public']);
+        
+        // Cache clearing endpoint
+        add_action('wp_ajax_ptp_clear_cache', [$this, 'ajax_clear_cache']);
+        add_shortcode('ptp_camp_finder', [$this, 'render_shortcode']);
+        
+        // Admin settings page for API key
+        add_action('admin_menu', [$this, 'add_admin_menu']);
+        add_action('admin_init', [$this, 'register_settings']);
+        
+        // Clear cache when products are saved/updated/deleted
+        add_action('save_post_product', [$this, 'clear_product_cache'], 10, 1);
+        add_action('delete_post', [$this, 'clear_product_cache'], 10, 1);
+        add_action('woocommerce_update_product', [$this, 'clear_product_cache']);
+        add_action('updated_post_meta', [$this, 'maybe_clear_cache_on_meta_update'], 10, 4);
+        
+        // Add script loader tag filter for async Google Maps
+        add_filter('script_loader_tag', [$this, 'async_google_maps_script'], 10, 2);
+        
+        // Flush rewrite rules on activation to ensure REST routes work
+        register_activation_hook(__FILE__, [$this, 'activate']);
+        
+        // Add manual flush rewrite rules action
+        add_action('admin_post_ptp_flush_rewrite_rules', [$this, 'flush_rewrite_rules_manual']);
+    }
+    
+    public function register_rest_routes_early() {
+        // Ensure routes are registered early (before rest_api_init)
+        // This is a fallback in case rest_api_init doesn't fire
+        $this->register_rest_routes();
+    }
+    
+    public function flush_rewrite_rules_manual() {
+        // Check user capabilities
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+        
+        // Verify nonce
+        check_admin_referer('ptp_flush_rewrite_rules');
+        
+        flush_rewrite_rules();
+        $this->register_rest_routes();
+        flush_rewrite_rules();
+        
+        wp_redirect(add_query_arg('ptp_flushed', '1', admin_url('options-general.php?page=ptp-camp-finder-settings')));
+        exit;
+    }
+    
+    public function async_google_maps_script($tag, $handle) {
+        // Handle both our unique handle and common google-maps handle
+        if ($handle === 'google-maps-ptp' || $handle === 'google-maps') {
+            // Skip if already processed to avoid duplicates
+            if (strpos($tag, 'data-ptp-processed') !== false) {
+                return $tag;
+            }
+            
+            // Fix: Remove any invalid loading=async defer from URL (should only be loading=async)
+            if (strpos($tag, 'loading=async defer') !== false || strpos($tag, 'loading=defer') !== false) {
+                $tag = preg_replace(
+                    '/loading=async defer|loading=defer/',
+                    'loading=async',
+                    $tag
+                );
+            }
+            
+            // Ensure loading=async is in URL (only once, and NOT with defer)
+            if (strpos($tag, 'loading=async') === false && strpos($tag, 'maps/api/js') !== false) {
+                // Check if URL already has parameters
+                if (strpos($tag, '?') !== false) {
+                    $tag = preg_replace(
+                        '/(src=["\']https:\/\/maps\.googleapis\.com\/maps\/api\/js[^"\']*)(["\'])/',
+                        '$1&loading=async$2',
+                        $tag
+                    );
+                } else {
+                    $tag = preg_replace(
+                        '/(src=["\']https:\/\/maps\.googleapis\.com\/maps\/api\/js)(["\'])/',
+                        '$1?loading=async$2',
+                        $tag
+                    );
+                }
+            }
+            
+            // Ensure async attribute is present (but NOT in the URL parameter)
+            if (strpos($tag, ' async') === false && strpos($tag, 'async') === false) {
+                $tag = str_replace('<script ', '<script async ', $tag);
+            }
+            
+            // Add defer attribute separately (not part of loading parameter)
+            if (strpos($tag, ' defer') === false) {
+                $tag = str_replace('<script ', '<script defer ', $tag);
+            }
+            
+            // Mark as processed to avoid duplicate processing
+            $tag = str_replace('<script ', '<script data-ptp-processed="1" ', $tag);
+        }
+        return $tag;
+    }
+    
+    public function activate() {
+        // Register routes first
+        $this->register_rest_routes();
+        // Then flush rewrite rules
+        flush_rewrite_rules();
+    }
+    
+    public function init() {
+        // Initialize any required functionality
+    }
+    
+    public function clear_product_cache($post_id = null) {
+        // Only clear cache for product post types
+        if ($post_id && get_post_type($post_id) !== 'product') {
+            return;
+        }
+        
+        // Clear all cached data when products change
+        delete_transient('product_ids_' . md5('all_published_products_100'));
+        delete_transient('map_pins_data');
+        delete_transient('camps_schema_json');
+        delete_transient('product_pin_stats'); // Clear stats cache too
+        
+        // Also clear any geocoding caches
+        global $wpdb;
+        $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_geocode_%'");
+        $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_geocode_%'");
+    }
+    
+    public function ajax_clear_cache() {
+        check_ajax_referer('ptp_clear_cache', 'nonce');
+        
+        $this->clear_product_cache();
+        
+        wp_send_json_success(['message' => 'Cache cleared successfully']);
+    }
+    
+    public function maybe_clear_cache_on_meta_update($meta_id, $object_id, $meta_key, $meta_value) {
+        // Clear cache if any PTP-related meta field is updated
+        if (get_post_type($object_id) === 'product') {
+            $ptp_meta_keys = ['ptp_lat', 'ptp_lng', 'ptp_event_venue_name', 'ptp_event_city', 'ptp_event_state', 'ptp_event_start', 'ptp_event_end', 'ptp_age_band'];
+            if (in_array($meta_key, $ptp_meta_keys, true)) {
+                $this->clear_product_cache($object_id);
+            }
+        }
+    }
+    
+    public function add_admin_menu() {
+        add_options_page(
+            'PTP Camp Finder Settings',
+            'PTP Camp Finder',
+            'manage_options',
+            'ptp-camp-finder-settings',
+            [$this, 'admin_page']
+        );
+    }
+    
+    public function register_settings() {
+        register_setting('ptp_camp_finder_settings', $this->api_key_option, 'sanitize_text_field');
+    }
+    
+    public function admin_page() {
+        if (isset($_POST['submit']) && check_admin_referer('ptp_camp_finder_settings')) {
+            update_option($this->api_key_option, sanitize_text_field($_POST['api_key'] ?? ''));
+            echo '<div class="notice notice-success"><p>Settings saved!</p></div>';
+        }
+        
+        // Show success message if rewrite rules were flushed
+        if (isset($_GET['ptp_flushed'])) {
+            echo '<div class="notice notice-success"><p>Rewrite rules flushed successfully! REST API endpoints should now be available.</p></div>';
+        }
+        
+        $api_key = get_option($this->api_key_option, $this->default_api_key);
+        
+        // Check if REST endpoint is working
+        $rest_url = rest_url('ptp/v1/map-pins');
+        $rest_check = wp_remote_get($rest_url, ['timeout' => 5]);
+        $rest_working = !is_wp_error($rest_check) && wp_remote_retrieve_response_code($rest_check) !== 404;
+        ?>
+        <div class="wrap">
+            <h1>PTP Camp Finder Settings</h1>
+            <form method="post" action="">
+                <?php wp_nonce_field('ptp_camp_finder_settings'); ?>
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">
+                            <label for="api_key">Google Maps API Key</label>
+                        </th>
+                        <td>
+                            <input type="text" id="api_key" name="api_key" value="<?php echo esc_attr($api_key); ?>" class="regular-text" />
+                            <p class="description">Google Maps API key is configured. You can update it here if needed.</p>
+                            <p class="description" style="color: #d63638; font-weight: 500;">
+                                <strong>Important:</strong> If you see a "RefererNotAllowedMapError" in the console, you need to add your domain to the Google Cloud Console API restrictions. 
+                                Add <code>ptpsummercamps.com/*</code> to your API key's HTTP referrer restrictions.
+                            </p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">REST API Status</th>
+                        <td>
+                            <?php if ($rest_working): ?>
+                                <p style="color: #00a32a; font-weight: 500;">✓ REST API endpoint is working correctly</p>
+                                <p class="description">Endpoint URL: <code><?php echo esc_url($rest_url); ?></code></p>
+                            <?php else: ?>
+                                <p style="color: #d63638; font-weight: 500;">✗ REST API endpoint is not available (404 error)</p>
+                                <p class="description">Click the button below to flush rewrite rules and register the endpoint.</p>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                </table>
+                <?php submit_button(); ?>
+            </form>
+            
+            <hr>
+            
+            <h2>REST API Troubleshooting</h2>
+            <p>If the REST API endpoint is showing as unavailable, try these steps:</p>
+            <ol>
+                <li>Click the button below to flush rewrite rules</li>
+                <li>Go to Settings → Permalinks and click "Save Changes" (this flushes rewrite rules again)</li>
+                <li>Deactivate and reactivate the plugin</li>
+            </ol>
+            
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <?php wp_nonce_field('ptp_flush_rewrite_rules'); ?>
+                <input type="hidden" name="action" value="ptp_flush_rewrite_rules">
+                <?php submit_button('Flush Rewrite Rules & Register REST Routes', 'secondary'); ?>
+            </form>
+            <h2>Usage</h2>
+            <p>Use the shortcode <code>[ptp_camp_finder]</code> on any page or post to display the Find a Camp page.</p>
+            <h2>Map Pins Location & Debugging</h2>
+            <p>Map pins are automatically generated from WooCommerce products. The system will:</p>
+            <ol>
+                <li>Check for existing <code>ptp_lat</code> and <code>ptp_lng</code> meta fields</li>
+                <li>If not found, extract addresses from product descriptions</li>
+                <li>Geocode addresses using Google Geocoding API</li>
+                <li>Save coordinates to product meta for future use</li>
+            </ol>
+            
+            <div style="background: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 15px 0;">
+                <h3 style="margin-top: 0;">How to Add Addresses to Products</h3>
+                <p><strong>Option 1: Add address to product description</strong></p>
+                <p>Include an address in your product's short description or full description. Example formats:</p>
+                <ul>
+                    <li><code>123 Main Street, Philadelphia, PA 19103</code></li>
+                    <li><code>456 Park Ave, New York, NY 10001</code></li>
+                    <li><code>789 Oak Boulevard, Princeton, NJ</code></li>
+                </ul>
+                
+                <p><strong>Option 2: Manually add coordinates</strong></p>
+                <p>Add custom fields to products:</p>
+                <ul>
+                    <li><code>ptp_lat</code> = Latitude (e.g., <code>40.3573</code>)</li>
+                    <li><code>ptp_lng</code> = Longitude (e.g., <code>-74.6672</code>)</li>
+                </ul>
+            </div>
+            
+            <div style="background: #d1ecf1; padding: 15px; border-left: 4px solid #0c5460; margin: 15px 0;">
+                <h3 style="margin-top: 0;">Debug Information</h3>
+                <p>Check your WordPress debug.log file (usually in wp-content/debug.log) for detailed information about:</p>
+                <ul>
+                    <li>How many products were processed</li>
+                    <li>Which addresses were extracted</li>
+                    <li>Geocoding success/failure</li>
+                    <li>Final pin count</li>
+                </ul>
+                <p><strong>To enable debug logging:</strong> Add these lines to your <code>wp-config.php</code>:</p>
+                <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto;">define('WP_DEBUG', true);
+define('WP_DEBUG_LOG', true);
+define('WP_DEBUG_DISPLAY', false);</pre>
+            </div>
+            
+            <h3 style="margin-top: 30px;">📍 How to Add Camp Locations</h3>
+            <div style="background: #e8f5e9; padding: 20px; border-left: 4px solid #4caf50; margin: 20px 0;">
+                <h4 style="margin-top: 0; color: #2e7d32;">⚠️ Currently: 0 pins found</h4>
+                <p><strong>You need to add locations to your WooCommerce products. Here's how:</strong></p>
+                
+                <h4>Method 1: Add Address to Product Description (EASIEST) ⭐</h4>
+                <ol>
+                    <li>Go to <strong>WooCommerce → Products</strong></li>
+                    <li>Edit a product</li>
+                    <li>In the <strong>product description</strong>, add an address like this:</li>
+                </ol>
+                <pre style="background: #fff; padding: 15px; border: 1px solid #ddd; border-radius: 4px; margin: 10px 0;">
+Location: 123 Main Street, Philadelphia, PA 19103</pre>
+                <p><strong>Supported formats:</strong></p>
+                <ul>
+                    <li><code>123 Main St, City, ST 12345</code></li>
+                    <li><code>Address: 123 Main Street, City, State 12345</code></li>
+                    <li><code>Location: 123 Main St, Philadelphia, PA 19103</code></li>
+                </ul>
+                <p>✅ The system will <strong>automatically find and geocode</strong> the address!</p>
+                
+                <h4>Method 2: Add Custom Fields (Manual Coordinates)</h4>
+                <ol>
+                    <li>Edit a product</li>
+                    <li>Scroll to <strong>Custom Fields</strong> (enable in Screen Options if hidden)</li>
+                    <li>Add these fields:</li>
+                </ol>
+                <pre style="background: #fff; padding: 15px; border: 1px solid #ddd; border-radius: 4px; margin: 10px 0;">
+Name: ptp_lat    Value: 40.3573
+Name: ptp_lng    Value: -74.6672</pre>
+                <p><small>💡 Find coordinates: <a href="https://www.google.com/maps" target="_blank">Google Maps</a> → Right-click location → Copy coordinates</small></p>
+                
+                <div style="background: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0;">
+                    <h4 style="margin-top: 0;">📥 Importing Products via CSV?</h4>
+                    <p><strong>Required Columns for Map Pins:</strong></p>
+                    <ul style="margin-bottom: 10px;">
+                        <li><code>Name</code> - Include location: <code>Winter Clinic Alexandria, VA January 18</code></li>
+                        <li><code>Short description</code> - Optional: <code>Location: 123 Main St, City, ST 12345</code></li>
+                        <li><code>Meta: ptp_lat</code> - Optional: Exact latitude (e.g., <code>38.8048</code>)</li>
+                        <li><code>Meta: ptp_lng</code> - Optional: Exact longitude (e.g., <code>-77.0469</code>)</li>
+                    </ul>
+                    <p><strong>Example CSV Row:</strong></p>
+                    <pre style="background: #fff; padding: 10px; border: 1px solid #ddd; font-size: 11px; overflow-x: auto; margin: 10px 0;">Type,Name,Published,Short description,Regular price
+simple,"Winter Soccer Clinic Alexandria VA January 18 2026",1,"Location: 123 Main Street, Alexandria, VA 22314",199</pre>
+                    <p style="margin: 0;"><a href="<?php echo esc_url(plugin_dir_url(__FILE__) . 'WOOCOMMERCE-IMPORT-GUIDE.md'); ?>" target="_blank" class="button button-secondary" style="margin-top: 10px;">📖 View Complete Import Guide</a></p>
+                </div>
+                
+                <p style="margin-top: 20px;">
+                    <button type="button" class="button" onclick="clearPTPCache()">🔄 Clear Cache & Retry</button>
+                </p>
+            </div>
+            
+            <h3 style="margin-top: 30px;">🔄 Force Regenerate Map Pins</h3>
+            <div style="background: #e3f2fd; padding: 15px; border-left: 4px solid #2196f3; margin: 15px 0;">
+                <p><strong>If pins aren't showing on the map, try this:</strong></p>
+                <ol>
+                    <li>Click "Clear Cache & Regenerate Pins" below</li>
+                    <li>Wait 30-60 seconds (geocoding takes time for multiple products)</li>
+                    <li>Refresh this page to check the new pin count</li>
+                    <li>Visit your Find-a-Camp page to see pins on the map</li>
+                </ol>
+                <button type="button" class="button button-primary" onclick="forceRegeneratePins()" style="margin-top: 10px;">
+                    🔄 Clear Cache & Regenerate Pins
+                </button>
+                <div id="ptp-regenerate-status" style="margin-top: 10px; display: none;"></div>
+            </div>
+            
+            <h3 style="margin-top: 30px;">Test Map Pins Endpoint</h3>
+            <p>Click the button below to test if map pins are being generated:</p>
+            <?php
+            $test_url = rest_url('ptp/v1/map-pins');
+            // Get current pin count (may be cached)
+            $test_pins = $this->get_map_pins_data();
+            ?>
+            <p>
+                <a href="<?php echo esc_url($test_url); ?>" target="_blank" class="button">📡 Test REST API Endpoint</a>
+                <span style="margin-left: 15px; font-weight: 600; color: <?php echo count($test_pins) > 0 ? '#4caf50' : '#f44336'; ?>;">
+                    Current Status: <?php echo count($test_pins); ?> pins found
+                </span>
+            </p>
+            <?php if (!empty($test_pins)): ?>
+                <div style="background: #e8f5e9; padding: 10px; border-left: 4px solid #4caf50; margin: 10px 0;">
+                    <p>✅ <strong>Pins are being generated!</strong> If they don't show on the map, check browser console (F12).</p>
+                </div>
+            <?php else: ?>
+                <div style="background: #ffebee; padding: 10px; border-left: 4px solid #f44336; margin: 10px 0;">
+                    <p>❌ <strong>No pins found.</strong> Add locations to your products using Method 1 or 2 above, then click "Clear Cache & Retry".</p>
+                </div>
+            <?php endif; ?>
+            <p><small>This will show you the raw JSON data of map pins. Check browser console (F12) for JavaScript errors.</small></p>
+            
+            <script>
+            function clearPTPCache() {
+                if (confirm('Clear all PTP cache? This will force the system to regenerate pins from products.')) {
+                    fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: 'action=ptp_clear_cache&nonce=<?php echo wp_create_nonce('ptp_clear_cache'); ?>'
+                    }).then(function(response) {
+                        return response.json();
+                    }).then(function(data) {
+                        if (data.success) {
+                            alert('✅ Cache cleared! The system will now regenerate pins from your products.\n\nIf you just added addresses to descriptions, wait 1-2 minutes for geocoding to complete, then refresh this page.');
+                            location.reload();
+                        } else {
+                            alert('Error clearing cache. Please try again.');
+                        }
+                    }).catch(function(error) {
+                        alert('Error: ' + error.message);
+                    });
+                }
+            }
+            
+            function forceRegeneratePins() {
+                const statusDiv = document.getElementById('ptp-regenerate-status');
+                statusDiv.style.display = 'block';
+                statusDiv.innerHTML = '<p style="color: #2196f3;">⏳ Clearing cache and regenerating pins... This may take 30-60 seconds.</p>';
+                
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'action=ptp_clear_cache&nonce=<?php echo wp_create_nonce('ptp_clear_cache'); ?>'
+                }).then(function(response) {
+                    return response.json();
+                }).then(function(data) {
+                    if (data.success) {
+                        statusDiv.innerHTML = '<p style="color: #4caf50;">✅ Cache cleared! Pins are being regenerated. Please wait 30-60 seconds, then refresh this page to see updated pin count.</p>';
+                        
+                        // Trigger pin generation by fetching the endpoint
+                        setTimeout(function() {
+                            fetch('<?php echo esc_js(home_url('/wp-json/ptp/v1/map-pins')); ?>', {
+                                method: 'GET',
+                                cache: 'no-cache'
+                            }).catch(function() {
+                                // If REST fails, try AJAX
+                                fetch('<?php echo admin_url('admin-ajax.php'); ?>?action=ptp_get_map_pins', {
+                                    method: 'GET',
+                                    cache: 'no-cache'
+                                });
+                            });
+                            
+                            statusDiv.innerHTML += '<p style="color: #2196f3; margin-top: 10px;">🔄 Triggered pin generation. Refresh this page in 30 seconds to see results.</p>';
+                        }, 2000);
+                    } else {
+                        statusDiv.innerHTML = '<p style="color: #f44336;">❌ Error clearing cache. Please try again.</p>';
+                    }
+                }).catch(function(error) {
+                    statusDiv.innerHTML = '<p style="color: #f44336;">❌ Error: ' + error.message + '</p>';
+                });
+            }
+            </script>
+            
+            <?php
+            // Show which products have pins and which don't (cached)
+            $cache_key_stats = 'product_pin_stats';
+            $pin_stats = get_transient($cache_key_stats);
+            
+            if ($pin_stats && is_array($pin_stats)) {
+                echo '<div style="background: #f5f5f5; padding: 15px; border-left: 4px solid #666; margin: 20px 0;">';
+                echo '<h4 style="margin-top: 0;">📊 Pin Generation Statistics</h4>';
+                echo '<ul style="margin: 0;">';
+                echo '<li><strong>Total Products:</strong> ' . esc_html($pin_stats['total_products']) . '</li>';
+                echo '<li><strong>Pins from Meta (existing coordinates):</strong> ' . esc_html($pin_stats['pins_from_meta']) . '</li>';
+                echo '<li><strong>Pins from Geocoding:</strong> ' . esc_html($pin_stats['pins_from_description']) . '</li>';
+                echo '<li><strong>Products without addresses:</strong> ' . esc_html($pin_stats['products_no_address']) . '</li>';
+                echo '<li><strong>Total Map Pins:</strong> ' . esc_html($pin_stats['total_pins']) . '</li>';
+                echo '</ul>';
+                
+                if ($pin_stats['products_no_address'] > 0) {
+                    echo '<div style="margin-top: 10px; padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107;">';
+                    echo '<p style="margin: 0;"><strong>⚠️ Note:</strong> Some products don\'t have addresses. Make sure your products have location data in their names, descriptions, or meta fields.</p>';
+                    echo '</div>';
+                }
+                echo '</div>';
+            }
+            
+            if (false === $pin_stats) {
+                // Cache miss - calculate stats
+                $all_products_query = new WP_Query([
+                    'post_type' => 'product',
+                    'post_status' => 'publish',
+                    'posts_per_page' => -1,
+                    'fields' => 'ids',
+                    'no_found_rows' => true,
+                ]);
+                
+                $products_with_pins = 0;
+                $products_without_pins = 0;
+                
+                if (!empty($all_products_query->posts)) {
+                    // Batch check meta
+                    foreach ($all_products_query->posts as $pid) {
+                        $lat = get_post_meta($pid, 'ptp_lat', true);
+                        $lng = get_post_meta($pid, 'ptp_lng', true);
+                        
+                        if (!empty($lat) && !empty($lng)) {
+                            $products_with_pins++;
+                        } else {
+                            $products_without_pins++;
+                        }
+                    }
+                }
+                wp_reset_postdata();
+                
+                $pin_stats = [
+                    'with_pins' => $products_with_pins,
+                    'without_pins' => $products_without_pins,
+                ];
+                
+                // Cache for 1 hour
+                set_transient($cache_key_stats, $pin_stats, 3600);
+            }
+            
+            $products_with_pins = $pin_stats['with_pins'];
+            $products_without_pins = $pin_stats['without_pins'];
+            ?>
+            
+            <div style="background: #f0f0f1; padding: 15px; border-left: 4px solid #2271b1; margin: 15px 0;">
+                <h3 style="margin-top: 0;">Map Pin Status</h3>
+                <p><strong>Products WITH map pins:</strong> <?php echo esc_html($products_with_pins); ?></p>
+                <p><strong>Products WITHOUT map pins:</strong> <?php echo esc_html($products_without_pins); ?></p>
+                <?php if ($products_with_pins === 0): ?>
+                    <p style="color: #d63638; font-weight: 600;">⚠️ No products have location coordinates. Add <code>ptp_lat</code> and <code>ptp_lng</code> to products to show pins on the map.</p>
+                <?php endif; ?>
+            </div>
+            
+            <h3>How Map Pins Work</h3>
+            <p>Map pins appear automatically for any WooCommerce product that has both latitude and longitude coordinates stored as custom fields.</p>
+            
+            <h3>Required WooCommerce Product Meta Fields for Map Pins</h3>
+            <ul>
+                <li><code>ptp_lat</code> - <strong>Required for pin</strong> - Latitude (e.g., <code>40.3573</code> for Princeton, NJ)</li>
+                <li><code>ptp_lng</code> - <strong>Required for pin</strong> - Longitude (e.g., <code>-74.6672</code> for Princeton, NJ)</li>
+                <li><code>ptp_event_venue_name</code> - Optional - Venue name (shown in info window)</li>
+                <li><code>ptp_event_city</code> - Optional - City name (shown in info window)</li>
+                <li><code>ptp_event_state</code> - Optional - State code (shown in info window)</li>
+                <li><code>ptp_event_start</code> - Optional - Start date/time</li>
+                <li><code>ptp_event_end</code> - Optional - End date/time</li>
+                <li><code>ptp_age_band</code> - Optional - Age range</li>
+            </ul>
+            
+            <h3>How to Add Location to Products</h3>
+            <ol>
+                <li>Go to <strong>WooCommerce → Products</strong></li>
+                <li>Edit the product you want to add a pin for</li>
+                <li>Scroll down to <strong>Custom Fields</strong> section (or use ACF if installed)</li>
+                <li>Add custom field: <code>ptp_lat</code> with value like <code>40.3573</code></li>
+                <li>Add custom field: <code>ptp_lng</code> with value like <code>-74.6672</code></li>
+                <li>Save the product</li>
+                <li>The pin will appear on the map automatically!</li>
+            </ol>
+            
+            <p><strong>Tip:</strong> Find coordinates by searching an address on <a href="https://www.google.com/maps" target="_blank">Google Maps</a> and right-clicking the location to see coordinates.</p>
+        </div>
+        <?php
+    }
+    
+    public function enqueue_scripts() {
+        // Only enqueue on pages with the shortcode
+        global $post;
+        if (is_a($post, 'WP_Post') && has_shortcode($post->post_content, 'ptp_camp_finder')) {
+            
+            // Get API key from options, fallback to default
+            $api_key = get_option($this->api_key_option, '');
+            if (empty($api_key)) {
+                $api_key = $this->default_api_key;
+            }
+            
+            // Check if Google Maps is already enqueued (by another plugin)
+            $maps_already_enqueued = wp_script_is('google-maps', 'enqueued') || 
+                                     wp_script_is('google-maps', 'registered') ||
+                                     wp_script_is('google-maps-ptp', 'enqueued');
+            
+            // Only enqueue if not already loaded
+            if (!empty($api_key) && !$maps_already_enqueued) {
+                // Use a unique handle to avoid conflicts
+                wp_enqueue_script(
+                    'google-maps-ptp',
+                    'https://maps.googleapis.com/maps/api/js?key=' . esc_attr($api_key) . '&libraries=places,marker&loading=async',
+                    [],
+                    null,
+                    true
+                );
+                
+                // Enqueue marker clustering library
+                wp_enqueue_script(
+                    'google-maps-markerclusterer',
+                    'https://unpkg.com/@googlemaps/markerclusterer/dist/index.min.js',
+                    ['google-maps-ptp'],
+                    null,
+                    true
+                );
+            } else {
+                // If already loaded, use the existing handle
+                wp_add_inline_script('google-maps', '/* PTP Maps ready */', 'after');
+            }
+            
+            // Inline our JavaScript to avoid file path issues
+            $js_content = $this->get_inline_js();
+            wp_add_inline_script('jquery', $js_content, 'after');
+            
+            // Enqueue styles
+            wp_add_inline_style('wp-block-library', $this->get_inline_styles());
+        }
+    }
+    
+    public function add_seo_meta() {
+        global $post;
+        if (!is_a($post, 'WP_Post') || !has_shortcode($post->post_content, 'ptp_camp_finder')) {
+            return;
+        }
+        
+        // Check if Yoast or RankMath is active
+        $yoast_active = defined('WPSEO_VERSION');
+        $rankmath_active = defined('RANK_MATH_VERSION');
+        
+        // Only add meta if SEO plugin is not active
+        if (!$yoast_active && !$rankmath_active) {
+            echo '<!-- PTP Camp Finder SEO Meta Tags -->' . "\n";
+            echo '<meta name="description" content="Find your perfect PTP Soccer Camp near you. Professional soccer training camps and clinics in Pennsylvania, New Jersey, Delaware, Maryland, and New York.">' . "\n";
+            echo '<meta property="og:title" content="Find Your Perfect PTP Soccer Camp">' . "\n";
+            echo '<meta property="og:description" content="Professional soccer training camps for players of all skill levels. Find winter clinics and summer camps near you.">' . "\n";
+            echo '<meta property="og:type" content="website">' . "\n";
+            echo '<meta property="og:url" content="' . esc_url(get_permalink()) . '">' . "\n";
+            echo '<meta name="twitter:card" content="summary_large_image">' . "\n";
+        }
+    }
+    
+    public function register_rest_routes() {
+        // Register map-pins endpoint - ensure namespace is registered
+        $namespace = 'ptp/v1';
+        
+        register_rest_route($namespace, '/map-pins', [
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => [$this, 'rest_get_map_pins'],
+            'permission_callback' => '__return_true',
+        ]);
+        
+        // Register nearby endpoint
+        register_rest_route($namespace, '/nearby', [
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => [$this, 'rest_get_nearby'],
+            'permission_callback' => '__return_true',
+            'args' => [
+                'zip' => [
+                    'required' => false,
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'radius' => [
+                    'required' => false,
+                    'type' => 'number',
+                    'default' => 50,
+                ],
+            ],
+        ]);
+    }
+    
+    public function rest_get_map_pins($request) {
+        // Clear any output that might interfere
+        if (ob_get_length()) {
+            ob_clean();
+        }
+        
+        // Use shared function for consistency
+        $pins = $this->get_map_pins_data();
+        
+        // Ensure we're returning an array
+        if (!is_array($pins)) {
+            $pins = [];
+        }
+        
+        // Log for debugging
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('PTP REST API: Returning ' . count($pins) . ' pins');
+        }
+        
+        $response = new WP_REST_Response($pins, 200);
+        $response->header('Content-Type', 'application/json; charset=utf-8');
+        $response->header('Cache-Control', 'public, max-age=1800'); // Cache for 30 min
+        
+        return $response;
+    }
+    
+    public function rest_get_nearby($request) {
+        $zip = $request->get_param('zip');
+        $radius = floatval($request->get_param('radius'));
+        
+        if (empty($zip) || !preg_match('/^\d{5}$/', $zip)) {
+            return new WP_Error('invalid_zip', 'Invalid ZIP code', ['status' => 400]);
+        }
+        
+        // Get lat/lng for ZIP (simplified - in production, use a geocoding service)
+        $zip_coords = $this->get_zip_coordinates($zip);
+        if (!$zip_coords) {
+            return new WP_Error('zip_not_found', 'ZIP code not found', ['status' => 404]);
+        }
+        
+        // Use native WooCommerce to get all published products
+        $wc_products = wc_get_products([
+            'status' => 'publish',
+            'limit' => -1,
+        ]);
+        
+        // Extract product IDs from WC_Product objects
+        $product_ids = [];
+        foreach ($wc_products as $wc_product) {
+            if ($wc_product && method_exists($wc_product, 'get_id')) {
+                $product_ids[] = $wc_product->get_id();
+            }
+        }
+        
+        $nearby = [];
+        
+        foreach ($product_ids as $product_id) {
+            $lat = get_post_meta($product_id, 'ptp_lat', true);
+            $lng = get_post_meta($product_id, 'ptp_lng', true);
+            
+            if (empty($lat) || empty($lng)) {
+                continue;
+            }
+            
+            $distance = $this->calculate_distance(
+                $zip_coords['lat'],
+                $zip_coords['lng'],
+                floatval($lat),
+                floatval($lng)
+            );
+            
+            if ($distance <= $radius) {
+                $nearby[] = [
+                    'id' => $product_id,
+                    'distance' => round($distance, 1),
+                ];
+            }
+        }
+        
+        // Sort by distance
+        usort($nearby, function($a, $b) {
+            return $a['distance'] <=> $b['distance'];
+        });
+        
+        return new WP_REST_Response($nearby, 200);
+    }
+    
+    public function render_shortcode($atts) {
+        $atts = shortcode_atts([
+            'show_hero' => 'true',
+            'show_map' => 'true',
+            'show_list' => 'true',
+        ], $atts);
+        
+        ob_start();
+        $this->render_camp_finder($atts);
+        return ob_get_clean();
+    }
+    
+    private function render_camp_finder($atts) {
+        // Output JSON-LD schema for all camps (cached)
+        try {
+            if (method_exists($this, 'output_camps_schema')) {
+                $this->output_camps_schema();
+            }
+        } catch (Error $e) {
+            // Method doesn't exist - skip schema output
+            // Silently fail to avoid breaking page
+        }
+        ?>
+        <div id="ptp-camp-finder" class="ptp-camp-finder-container">
+            
+            <?php if ($atts['show_hero'] === 'true'): ?>
+            <!-- Hero Section with Video -->
+            <section class="ptp-camp-finder-hero" role="banner">
+                    <video 
+                    class="ptp-hero-video" 
+                    id="ptp-hero-video"
+                    autoplay 
+                    muted 
+                    loop 
+                    playsinline
+                    preload="none"
+                    poster=""
+                >
+                    <source src="https://ptpsummercamps.com/wp-content/uploads/2025/10/skill-clinic-1.mp4" type="video/mp4">
+                    Your browser does not support the video tag.
+                </video>
+                <div class="ptp-hero-overlay"></div>
+                
+                <!-- Video Controls -->
+                <div class="ptp-video-controls">
+                    <button type="button" class="ptp-video-btn ptp-video-play-pause" id="ptp-video-play-pause" aria-label="Play/Pause video">
+                        <span class="ptp-video-icon ptp-icon-pause" aria-hidden="true">⏸</span>
+                        <span class="ptp-video-icon ptp-icon-play" aria-hidden="true" style="display: none;">▶</span>
+                    </button>
+                    <button type="button" class="ptp-video-btn ptp-video-sound" id="ptp-video-sound" aria-label="Toggle sound">
+                        <span class="ptp-video-icon ptp-icon-muted" aria-hidden="true">🔇</span>
+                        <span class="ptp-video-icon ptp-icon-unmuted" aria-hidden="true" style="display: none;">🔊</span>
+                    </button>
+                </div>
+                
+                <div class="ptp-hero-content">
+                    <h1 class="ptp-hero-title">Find Your Perfect PTP Soccer Camp</h1>
+                    <p class="ptp-hero-subtitle">Teaching What Team Coaches Don't</p>
+                    <p class="ptp-hero-description">Join thousands of players who have improved their skills with our expert coaching staff. Professional soccer training camps available in Pennsylvania, New Jersey, Delaware, Maryland, and New York.</p>
+                    
+                    <div class="ptp-hero-search">
+                        <label for="ptp-zip-search" class="sr-only">Enter your ZIP code</label>
+                        <input 
+                            type="text" 
+                            id="ptp-zip-search" 
+                            class="ptp-zip-input" 
+                            placeholder="Enter ZIP code" 
+                            maxlength="5" 
+                            pattern="\d{5}"
+                            aria-label="Enter your ZIP code to find nearby camps"
+                        />
+                        <button type="button" id="ptp-find-camps-btn" class="ptp-hero-btn">
+                            Find Camps Near Me
+                        </button>
+                        <button type="button" id="ptp-use-location-btn" class="ptp-hero-btn ptp-location-btn" title="Use your current location">
+                            📍 Use My Location
+                        </button>
+                    </div>
+                    
+                    <a href="#ptp-camps-section" class="ptp-scroll-indicator" aria-label="Scroll to camps">
+                        <span>↓</span>
+                    </a>
+                </div>
+            </section>
+            <?php endif; ?>
+            
+            <div id="ptp-camps-section" class="ptp-camps-main">
+                
+                <?php if ($atts['show_map'] === 'true'): ?>
+                <!-- Google Maps Section -->
+                <section class="ptp-map-section" aria-label="Camp locations map">
+                    <div class="ptp-map-container">
+                        <div id="ptp-camps-map" class="ptp-map" role="application" aria-label="Interactive map showing camp locations"></div>
+                        <div class="ptp-map-loading" id="ptp-map-loading">
+                            <span>Loading map...</span>
+                        </div>
+                        <div class="ptp-map-error" id="ptp-map-error" style="display: none;">
+                            <p>Unable to load map. Please try again later.</p>
+                        </div>
+                    </div>
+                </section>
+                <?php endif; ?>
+                
+                <?php if ($atts['show_list'] === 'true'): ?>
+                <!-- Simplified Camp List Section -->
+                <section class="ptp-camps-list-section">
+                    <div class="ptp-container">
+                        <div class="ptp-list-header">
+                            <h2>Available Camps</h2>
+                        </div>
+                        
+                        <!-- Camp List - Simple Grid -->
+                        <div class="ptp-camps-grid" id="ptp-camps-grid">
+                            <?php
+                            // Check if WooCommerce is active
+                            if (!class_exists('WooCommerce') || !function_exists('wc_get_product')) {
+                                echo '<div class="ptp-no-results"><h3>Error</h3><p>WooCommerce is not active. Please activate WooCommerce plugin.</p></div>';
+                            } else {
+                                // Use cached product IDs for faster loading
+                                $cache_key = 'product_ids_' . md5('all_published_products_100');
+                                $product_ids = get_transient($cache_key);
+                                
+                                if (false === $product_ids) {
+                                    // Cache miss - query products
+                                    $args = [
+                                        'post_type' => 'product',
+                                        'post_status' => 'publish',
+                                        'posts_per_page' => 100,
+                                        'orderby' => 'menu_order title',
+                                        'order' => 'ASC',
+                                        'fields' => 'ids', // Only get IDs for better performance
+                                        'no_found_rows' => true, // Skip pagination count for speed
+                                        'update_post_meta_cache' => false, // Skip meta cache update
+                                        'update_post_term_cache' => false, // Skip term cache update
+                                    ];
+                                    
+                                    $query = new WP_Query($args);
+                                    $product_ids = [];
+                                    
+                                    if (!empty($query->posts)) {
+                                        // Batch check product visibility
+                                        foreach ($query->posts as $product_id) {
+                                            // Quick check without loading full product object
+                                            $product = wc_get_product($product_id);
+                                            if ($product && $product->is_visible()) {
+                                                $product_ids[] = $product_id;
+                                            }
+                                        }
+                                    }
+                                    wp_reset_postdata();
+                                    
+                                    // Cache for 30 minutes
+                                    set_transient($cache_key, $product_ids, 1800);
+                                }
+                                
+                                // Display products
+                                if (!empty($product_ids) && is_array($product_ids)) {
+                                    foreach ($product_ids as $product_id) {
+                                        $card_html = $this->render_camp_card($product_id);
+                                        if (!empty($card_html)) {
+                                            echo $card_html;
+                                        }
+                                    }
+                                } else {
+                                    echo '<div class="ptp-no-results"><h3>No camps found</h3><p>No published WooCommerce products were found. Please create products in WooCommerce → Products.</p></div>';
+                                }
+                            }
+                            ?>
+                        </div>
+                    </div>
+                </section>
+                <?php endif; ?>
+                
+            </div>
+        </div>
+        <?php
+    }
+    
+    private function output_camps_schema() {
+        // Check if WooCommerce functions are available
+        if (!function_exists('wc_get_products') || !function_exists('wc_get_product')) {
+            return; // Exit silently if WooCommerce isn't available
+        }
+        
+        // Cache schema output for 1 hour (schema doesn't change often)
+        $cache_key = 'camps_schema_json';
+        $schema_json = get_transient($cache_key);
+        
+        if (false !== $schema_json) {
+            echo $schema_json; // Output cached schema
+            return;
+        }
+        
+        // Cache miss - generate schema
+        // Optimized query - only get products with dates (required for schema)
+        $args = [
+            'post_type' => 'product',
+            'post_status' => 'publish',
+            'posts_per_page' => -1,
+            'fields' => 'ids',
+            'no_found_rows' => true,
+            'meta_query' => [
+                [
+                    'key' => 'ptp_event_start',
+                    'compare' => 'EXISTS',
+                ],
+            ],
+        ];
+        
+        $query = new WP_Query($args);
+        $product_ids = $query->posts ?: [];
+        wp_reset_postdata();
+        
+        if (empty($product_ids)) {
+            $schema_json = ''; // Cache empty result
+            set_transient($cache_key, $schema_json, 3600);
+            return;
+        }
+        
+        // Batch get meta data
+        $meta_keys = ['ptp_event_venue_name', 'ptp_event_city', 'ptp_event_state', 'ptp_event_start', 'ptp_event_end', 'ptp_age_band'];
+        $meta_data = [];
+        foreach ($product_ids as $product_id) {
+            $all_meta = get_post_meta($product_id);
+            foreach ($meta_keys as $key) {
+                $meta_data[$product_id][$key] = isset($all_meta[$key][0]) ? $all_meta[$key][0] : '';
+            }
+        }
+        
+        $schemas = [];
+        
+        foreach ($product_ids as $product_id) {
+            $start_date = isset($meta_data[$product_id]['ptp_event_start']) ? $meta_data[$product_id]['ptp_event_start'] : '';
+            
+            if (empty($start_date)) {
+                continue;
+            }
+            
+            $wc_product = wc_get_product($product_id);
+            if (!$wc_product) {
+                continue;
+            }
+            
+            $venue = isset($meta_data[$product_id]['ptp_event_venue_name']) ? $meta_data[$product_id]['ptp_event_venue_name'] : '';
+            $city = isset($meta_data[$product_id]['ptp_event_city']) ? $meta_data[$product_id]['ptp_event_city'] : '';
+            $state = isset($meta_data[$product_id]['ptp_event_state']) ? $meta_data[$product_id]['ptp_event_state'] : '';
+            $end_date = isset($meta_data[$product_id]['ptp_event_end']) ? $meta_data[$product_id]['ptp_event_end'] : '';
+            $age_band = isset($meta_data[$product_id]['ptp_age_band']) ? $meta_data[$product_id]['ptp_age_band'] : '';
+            
+            // Convert ISO 8601 date if needed
+            if (!empty($start_date)) {
+                $start_date = date('c', strtotime($start_date));
+            }
+            if (!empty($end_date)) {
+                $end_date = date('c', strtotime($end_date));
+            } else {
+                $end_date = $start_date;
+            }
+            
+            $schema = [
+                '@context' => 'https://schema.org',
+                '@type' => 'SportsEvent',
+                'name' => esc_html($wc_product->get_name()), // Use WooCommerce method
+                'startDate' => $start_date,
+                'endDate' => $end_date,
+                'location' => [
+                    '@type' => 'Place',
+                    'name' => esc_html($venue ?: $city),
+                    'address' => [
+                        '@type' => 'PostalAddress',
+                        'addressLocality' => esc_html($city),
+                        'addressRegion' => esc_html($state),
+                        'addressCountry' => 'US',
+                    ],
+                ],
+                'offers' => [
+                    '@type' => 'Offer',
+                    'price' => floatval($wc_product->get_price()), // Native WooCommerce method
+                    'priceCurrency' => 'USD',
+                    'availability' => $wc_product->is_in_stock() ? 'InStock' : 'OutOfStock', // Native WooCommerce method
+                    'url' => $wc_product->get_permalink(), // Native WooCommerce method
+                ],
+                'organizer' => [
+                    '@type' => 'SportsOrganization',
+                    'name' => 'Players Teaching Players',
+                ],
+            ];
+            
+            if (!empty($age_band)) {
+                $schema['audience'] = [
+                    '@type' => 'Audience',
+                    'audienceType' => esc_html($age_band),
+                ];
+            }
+            
+            $schemas[] = $schema;
+        }
+        
+        // Output schemas
+        if (!empty($schemas)) {
+            ob_start();
+            echo '<script type="application/ld+json">' . "\n";
+            if (count($schemas) === 1) {
+                echo wp_json_encode($schemas[0], JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+            } else {
+                echo wp_json_encode($schemas, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+            }
+            echo "\n" . '</script>' . "\n";
+            $schema_json = ob_get_clean();
+            
+            // Cache the output
+            set_transient($cache_key, $schema_json, 3600);
+            echo $schema_json;
+        } else {
+            // Cache empty result
+            set_transient($cache_key, '', 3600);
+        }
+    }
+    
+    public function ajax_load_camps() {
+        // Simplified - just return all products (no filters needed)
+        check_ajax_referer('ptp_camp_finder_nonce', 'nonce');
+        
+        $sort = isset($_POST['sort']) ? sanitize_text_field($_POST['sort']) : 'date-asc';
+        $page = isset($_POST['page']) ? max(1, intval($_POST['page'])) : 1;
+        $per_page = isset($_POST['per_page']) ? max(1, intval($_POST['per_page'])) : 12;
+        
+        try {
+            $products = $this->get_filtered_camps([], [], 0, 0, $sort, $page, $per_page, '');
+            
+            $html = '';
+            foreach ($products['products'] as $product_id) {
+                $html .= $this->render_camp_card($product_id);
+            }
+            
+            wp_send_json_success([
+                'html' => $html,
+                'has_more' => $products['has_more'],
+                'total' => $products['total'],
+            ]);
+        } catch (Exception $e) {
+            wp_send_json_error([
+                'message' => 'Failed to load camps: ' . $e->getMessage()
+            ]);
+        }
+    }
+    
+    public function ajax_get_map_pins() {
+        // AJAX handler for logged-in users (with nonce check)
+        check_ajax_referer('ptp_map_pins_nonce', 'nonce');
+        $this->ajax_send_map_pins();
+    }
+    
+    public function ajax_get_map_pins_public() {
+        // AJAX handler for public (no nonce required)
+        $this->ajax_send_map_pins();
+    }
+    
+    private function ajax_send_map_pins() {
+        // Use the same logic as REST endpoint
+        $pins = $this->get_map_pins_data();
+        
+        // Ensure we're sending an array
+        if (!is_array($pins)) {
+            $pins = [];
+        }
+        
+        wp_send_json_success($pins);
+    }
+    
+    private function extract_address_from_description($description) {
+        if (empty($description)) {
+            return null;
+        }
+        
+        // Remove HTML tags and normalize whitespace
+        $text = wp_strip_all_tags($description);
+        $text = preg_replace('/\s+/', ' ', $text);
+        
+        // Common address patterns to match (ordered from most specific to least):
+        // 1. Full street address with ZIP: "123 Main St, City, ST 12345"
+        // 2. Address with label: "Location: 123 Main St, City, ST 12345"
+        // 3. City, State ZIP only: "City, ST 12345"
+        // 4. City, State abbreviation: "City, ST"
+        
+        $patterns = [
+            // Pattern 1: Full address with "Location:", "Address:", "Venue:" prefix
+            '/(?:Location|Address|Venue|Address|Where)[:\s]+(\d+\s+[A-Za-z0-9\s\.,#-]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|Court|Ct|Pl|Place|Pkwy|Parkway|Circle|Cir|Highway|Hwy)[,.\s]*,?\s*[A-Za-z\s]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)/i',
+            
+            // Pattern 2: Full street address with ZIP (anywhere in text)
+            '/(\d+\s+[A-Za-z0-9\s\.,#-]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|Court|Ct|Pl|Place|Pkwy|Parkway|Circle|Cir|Highway|Hwy)[,.\s]*,?\s*[A-Za-z\s]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)/i',
+            
+            // Pattern 3: Address without ZIP but with street
+            '/(\d+\s+[A-Za-z0-9\s\.,#-]+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|Court|Ct|Pl|Place|Pkwy|Parkway|Circle|Cir|Highway|Hwy)[,.\s]*,?\s*[A-Za-z\s]+,\s*[A-Z]{2})/i',
+            
+            // Pattern 4: City, State ZIP (e.g., "Alexandria, VA 22314")
+            '/([A-Za-z][A-Za-z\s]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)/',
+            
+            // Pattern 5: Location prefix with city, state (e.g., "Location: Main Line, PA")
+            '/(?:Location|Address|Venue)[:\s]+([A-Za-z][A-Za-z\s/]+,\s*[A-Z]{2})(?:\s|—|$)/i',
+            
+            // Pattern 6: City, State abbreviation anywhere (handles "Main Line, PA", "West Chester, PA", "Summit/Chatham, NJ")
+            // Also handles product names like "Winter Soccer Clinic Doylestown, PA - January 4" or "Doylestown, PA — December 14"
+            // Handles various separators: space, hyphen, em dash, en dash
+            // Captures cities with spaces, commas, or slashes (e.g., "Main Line, PA" or "Summit/Chatham, NJ")
+            '/([A-Za-z][A-Za-z\s/\'-]+,\s*(?:PA|NJ|DE|MD|NY|CT|MA|RI|VA|WV|OH|DC|NC|SC|GA|FL|TX|CA|IL|MI|WI|MN|IA|MO|AR|LA|MS|AL|TN|KY|IN))(?:\s*[—–-]|\s+[A-Z]|\s*,\s*[A-Z]|\s*$)/i',
+        ];
+        
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $text, $matches)) {
+                $address = trim($matches[1]);
+                // Clean up common trailing punctuation and special chars
+                $address = rtrim($address, '.,;—–');
+                
+                // Handle locations with slashes (like "Summit/Chatham, NJ") - use first city for geocoding
+                if (strpos($address, '/') !== false && strpos($address, ',') !== false) {
+                    $parts = explode(',', $address);
+                    $city_part = trim(explode('/', $parts[0])[0]); // Take first city before slash
+                    $state_part = isset($parts[1]) ? trim($parts[1]) : '';
+                    if (!empty($city_part) && !empty($state_part)) {
+                        $address = $city_part . ', ' . $state_part;
+                    }
+                }
+                
+                return $address;
+            }
+        }
+        
+        return null;
+    }
+    
+    private function geocode_address($address) {
+        if (empty($address)) {
+            return null;
+        }
+        
+        // Check cache first (cache geocoded results per address)
+        $cache_key = 'geocode_' . md5(strtolower(trim($address)));
+        $cached = get_transient($cache_key);
+        
+        if (false !== $cached && isset($cached['lat']) && isset($cached['lng'])) {
+            return $cached;
+        }
+        
+        // Get API key
+        $api_key = get_option($this->api_key_option, $this->default_api_key);
+        if (empty($api_key)) {
+            return null;
+        }
+        
+        // Use Google Geocoding API
+        $url = 'https://maps.googleapis.com/maps/api/geocode/json';
+        $params = [
+            'address' => urlencode($address),
+            'key' => $api_key,
+        ];
+        
+        $geocode_url = $url . '?' . http_build_query($params);
+        
+        $response = wp_remote_get($geocode_url, [
+            'timeout' => 10,
+            'sslverify' => true,
+        ]);
+        
+        if (is_wp_error($response)) {
+            error_log('PTP Geocoding Error: ' . $response->get_error_message());
+            return null;
+        }
+        
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body, true);
+        
+        if (empty($data) || $data['status'] !== 'OK' || empty($data['results'])) {
+            error_log('PTP Geocoding API Error: ' . ($data['status'] ?? 'Unknown error'));
+            return null;
+        }
+        
+        $result = $data['results'][0];
+        $location = $result['geometry']['location'];
+        
+        $geocoded = [
+            'lat' => floatval($location['lat']),
+            'lng' => floatval($location['lng']),
+            'formatted_address' => $result['formatted_address'] ?? $address,
+        ];
+        
+        // Extract address components for better parsing
+        foreach ($result['address_components'] as $component) {
+            if (in_array('locality', $component['types'])) {
+                $geocoded['city'] = $component['long_name'];
+            }
+            if (in_array('administrative_area_level_1', $component['types'])) {
+                $geocoded['state'] = $component['short_name'];
+            }
+            if (in_array('postal_code', $component['types'])) {
+                $geocoded['zip'] = $component['long_name'];
+            }
+        }
+        
+        // Cache for 30 days (addresses don't change often)
+        set_transient($cache_key, $geocoded, 30 * DAY_IN_SECONDS);
+        
+        return $geocoded;
+    }
+    
+    private function get_map_pins_data() {
+        // Check if WooCommerce is active first
+        if (!function_exists('wc_get_product')) {
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                error_log('PTP: WooCommerce functions not available');
+            }
+            return [];
+        }
+        
+        // Cache map pins data for 1 hour (longer cache for performance)
+        $cache_key = 'map_pins_data';
+        $pins = get_transient($cache_key);
+        
+        if (false !== $pins && is_array($pins)) {
+            // Log for debugging if empty (only when debugging)
+            if (empty($pins) && defined('WP_DEBUG') && WP_DEBUG) {
+                error_log('PTP: Returning cached empty pins array');
+            }
+            return $pins;
+        }
+        
+        // Get all published products (no filter for lat/lng - we'll extract from descriptions)
+        $args = [
+            'post_type' => 'product',
+            'post_status' => 'publish',
+            'posts_per_page' => -1,
+            'fields' => 'ids',
+            'no_found_rows' => true,
+        ];
+        
+        $query = new WP_Query($args);
+        $product_ids = $query->posts ?: [];
+        wp_reset_postdata();
+        
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('PTP: Found ' . count($product_ids) . ' published products');
+        }
+        
+        if (empty($product_ids)) {
+            set_transient($cache_key, [], 3600); // Cache for 1 hour
+            return [];
+        }
+        
+        // Batch get meta data
+        $meta_keys = ['ptp_lat', 'ptp_lng', 'ptp_event_venue_name', 'ptp_event_city', 'ptp_event_state', 'ptp_event_start', 'ptp_event_end'];
+        $meta_data = [];
+        foreach ($product_ids as $product_id) {
+            $all_meta = get_post_meta($product_id);
+            foreach ($meta_keys as $key) {
+                $meta_data[$product_id][$key] = isset($all_meta[$key][0]) ? $all_meta[$key][0] : '';
+            }
+        }
+        
+        // Also batch get product attributes (WooCommerce product attributes can be used for location data)
+        $product_attributes = [];
+        foreach ($product_ids as $product_id) {
+            $wc_product = wc_get_product($product_id);
+            if ($wc_product) {
+                $product_attributes[$product_id] = [
+                    'city' => $wc_product->get_attribute('city') ?: $wc_product->get_attribute('City'),
+                    'state' => $wc_product->get_attribute('state') ?: $wc_product->get_attribute('State'),
+                    'venue' => $wc_product->get_attribute('venue') ?: $wc_product->get_attribute('Venue'),
+                    'location' => $wc_product->get_attribute('location') ?: $wc_product->get_attribute('Location'),
+                ];
+            }
+        }
+        
+        $pins = [];
+        $pins_from_meta = 0;
+        $pins_from_description = 0;
+        $products_no_address = 0;
+        $total_products = count($product_ids);
+        
+        foreach ($product_ids as $product_id) {
+            $wc_product = wc_get_product($product_id);
+            if (!$wc_product || !$wc_product->is_visible()) {
+                if (defined('WP_DEBUG') && WP_DEBUG && !$wc_product->is_visible()) {
+                    error_log("PTP: Product #{$product_id} is not visible, skipping");
+                }
+                continue;
+            }
+            
+            // Check for existing lat/lng first (backward compatibility)
+            $lat = isset($meta_data[$product_id]['ptp_lat']) ? $meta_data[$product_id]['ptp_lat'] : '';
+            $lng = isset($meta_data[$product_id]['ptp_lng']) ? $meta_data[$product_id]['ptp_lng'] : '';
+            $source = 'meta';
+            
+            // If no existing coordinates, try to extract from description or title
+            if (empty($lat) || empty($lng)) {
+                // Collect all text sources to search for addresses (order matters - most specific first)
+                $text_sources = [];
+                
+                // 1. Try product title first (e.g., "Winter Soccer Clinic Main Line, PA — December 14 2025")
+                // Product names often have location most reliably
+                $product_title = $wc_product->get_name();
+                if (!empty($product_title)) {
+                    $text_sources[] = $product_title;
+                }
+                
+                // 2. Try short description (often has "Location: City, State")
+                $short_desc = $wc_product->get_short_description();
+                if (!empty($short_desc)) {
+                    $text_sources[] = $short_desc;
+                }
+                
+                // 3. Try full description
+                $full_desc = $wc_product->get_description();
+                if (!empty($full_desc) && $full_desc !== $short_desc) {
+                    $text_sources[] = $full_desc;
+                }
+                
+                // 4. Check common location meta fields (some themes/plugins use these)
+                $location_meta_fields = [
+                    '_camp_location',        // CSV import meta fields
+                    '_camp_state',           // CSV import meta fields
+                    '_ptp_address',          // Product page meta
+                    '_ptp_city',             // Product page meta
+                    '_ptp_state',            // Product page meta
+                    '_ptp_zip',              // Product page meta
+                    '_location',
+                    'location',
+                    '_event_location',
+                    'event_location',
+                    '_venue',
+                    'venue',
+                    '_address',
+                    'address',
+                    '_event_venue',
+                    'event_venue',
+                ];
+                
+                foreach ($location_meta_fields as $meta_key) {
+                    $meta_value = get_post_meta($product_id, $meta_key, true);
+                    if (!empty($meta_value) && is_string($meta_value)) {
+                        $text_sources[] = $meta_value;
+                    }
+                }
+                
+                // Special handling: Combine product page meta fields into full address
+                $ptp_address = get_post_meta($product_id, '_ptp_address', true);
+                $ptp_city = get_post_meta($product_id, '_ptp_city', true);
+                $ptp_state = get_post_meta($product_id, '_ptp_state', true);
+                $ptp_zip = get_post_meta($product_id, '_ptp_zip', true);
+                
+                if (!empty($ptp_address) || !empty($ptp_city)) {
+                    $combined_address = trim(($ptp_address ? $ptp_address . ', ' : '') . 
+                                             ($ptp_city ? $ptp_city : '') . 
+                                             ($ptp_state ? ', ' . $ptp_state : '') . 
+                                             ($ptp_zip ? ' ' . $ptp_zip : ''), ', ');
+                    
+                    if (!empty($combined_address)) {
+                        $text_sources[] = $combined_address;
+                    }
+                }
+                
+                // Try to extract address from all collected text sources
+                $address = null;
+                foreach ($text_sources as $text) {
+                    $address = $this->extract_address_from_description($text);
+                    if ($address) {
+                        break; // Found an address, stop searching
+                    }
+                }
+                
+                // Fallback: If no address extracted but we have city/state in meta or attributes, use those
+                // This is important for products imported via CSV with Meta: ptp_event_city and Meta: ptp_event_state
+                // OR with WooCommerce attributes like City, State, Venue
+                if (!$address) {
+                    $city = isset($meta_data[$product_id]['ptp_event_city']) ? trim($meta_data[$product_id]['ptp_event_city']) : '';
+                    $state = isset($meta_data[$product_id]['ptp_event_state']) ? trim($meta_data[$product_id]['ptp_event_state']) : '';
+                    
+                    // Try WooCommerce attributes as fallback
+                    if (empty($city) && isset($product_attributes[$product_id]['city'])) {
+                        $city = trim($product_attributes[$product_id]['city']);
+                    }
+                    if (empty($state) && isset($product_attributes[$product_id]['state'])) {
+                        $state = trim($product_attributes[$product_id]['state']);
+                    }
+                    
+                    // Handle locations with slashes like "Summit/Chatham, NJ" - use first city
+                    if (strpos($city, '/') !== false) {
+                        $city = trim(explode('/', $city)[0]);
+                    }
+                    
+                    // Clean up any extra whitespace or special chars
+                    $city = trim($city);
+                    $state = trim($state);
+                    
+                    // If we have both city and state, use them for geocoding
+                    if (!empty($city) && !empty($state)) {
+                        $address = $city . ', ' . $state;
+                        
+                        // Log for debugging
+                        if (defined('WP_DEBUG') && WP_DEBUG) {
+                            error_log("PTP: Using meta/attributes for product #{$product_id}: {$address}");
+                        }
+                    }
+                }
+                
+                if ($address) {
+                    // Log for debugging
+                    if (defined('WP_DEBUG') && WP_DEBUG) {
+                        error_log("PTP: Extracted address for product #{$product_id}: {$address}");
+                    }
+                    
+                    // Geocode the address (this may take time on first run)
+                    $geocoded = $this->geocode_address($address);
+                    
+                    if ($geocoded && isset($geocoded['lat']) && isset($geocoded['lng'])) {
+                        $lat = $geocoded['lat'];
+                        $lng = $geocoded['lng'];
+                        $source = 'description';
+                        $pins_from_description++;
+                        
+                        // Save geocoded coordinates to meta for future use (cache them)
+                        update_post_meta($product_id, 'ptp_lat', $lat);
+                        update_post_meta($product_id, 'ptp_lng', $lng);
+                        
+                        // Update city/state if not already set (or if extracted better data)
+                        if (empty($meta_data[$product_id]['ptp_event_city']) && isset($geocoded['city'])) {
+                            update_post_meta($product_id, 'ptp_event_city', $geocoded['city']);
+                            $meta_data[$product_id]['ptp_event_city'] = $geocoded['city'];
+                        }
+                        if (empty($meta_data[$product_id]['ptp_event_state']) && isset($geocoded['state'])) {
+                            update_post_meta($product_id, 'ptp_event_state', $geocoded['state']);
+                            $meta_data[$product_id]['ptp_event_state'] = $geocoded['state'];
+                        }
+                        
+                        // Log success
+                        if (defined('WP_DEBUG') && WP_DEBUG) {
+                            error_log("PTP: Successfully geocoded product #{$product_id}: {$address} -> ({$lat}, {$lng})");
+                        }
+                    } else {
+                        // Log for debugging
+                        if (defined('WP_DEBUG') && WP_DEBUG) {
+                            error_log("PTP: Geocoding failed for product #{$product_id} with address: {$address}");
+                        }
+                        $products_no_address++;
+                    }
+                } else {
+                    // No address extracted - log for debugging
+                    if (defined('WP_DEBUG') && WP_DEBUG) {
+                        error_log("PTP: No address extracted from product #{$product_id} (title: '{$wc_product->get_name()}')");
+                    }
+                    $products_no_address++;
+                }
+            } else {
+                $pins_from_meta++;
+            }
+            
+            // Skip if still no coordinates
+            if (empty($lat) || empty($lng)) {
+                continue;
+            }
+            
+            // Validate coordinates are numeric
+            $lat_float = floatval($lat);
+            $lng_float = floatval($lng);
+            
+            if (empty($lat_float) || empty($lng_float) || $lat_float == 0 || $lng_float == 0 || abs($lat_float) > 90 || abs($lng_float) > 180) {
+                continue; // Skip invalid coordinates
+            }
+            
+            $venue = isset($meta_data[$product_id]['ptp_event_venue_name']) ? $meta_data[$product_id]['ptp_event_venue_name'] : '';
+            $city = isset($meta_data[$product_id]['ptp_event_city']) ? $meta_data[$product_id]['ptp_event_city'] : '';
+            $state = isset($meta_data[$product_id]['ptp_event_state']) ? $meta_data[$product_id]['ptp_event_state'] : '';
+            $start_date = isset($meta_data[$product_id]['ptp_event_start']) ? $meta_data[$product_id]['ptp_event_start'] : '';
+            $end_date = isset($meta_data[$product_id]['ptp_event_end']) ? $meta_data[$product_id]['ptp_event_end'] : '';
+            
+            $pins[] = [
+                'id' => intval($product_id),
+                'lat' => $lat_float,
+                'lng' => $lng_float,
+                'title' => $wc_product->get_name(),
+                'permalink' => $wc_product->get_permalink(),
+                'venue' => esc_html($venue),
+                'city' => esc_html($city),
+                'state' => esc_html($state),
+                'address' => trim(esc_html($venue) . ($venue && ($city || $state) ? ', ' : '') . esc_html($city) . ($city && $state ? ', ' : '') . esc_html($state)),
+                'start_date' => $start_date,
+                'end_date' => $end_date,
+                'price' => $wc_product->get_price_html(),
+            ];
+        }
+        
+        // Cache for 1 hour for better performance
+        set_transient($cache_key, $pins, 3600);
+        
+        // Log summary for debugging
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log("PTP Map Pins Summary: {$pins_from_meta} from meta, {$pins_from_description} from geocoding, {$products_no_address} without addresses, {$total_products} total");
+        }
+        
+        // Cache statistics for admin panel
+        set_transient('product_pin_stats', [
+            'total_products' => $total_products,
+            'pins_from_meta' => $pins_from_meta,
+            'pins_from_description' => $pins_from_description,
+            'products_no_address' => $products_no_address,
+            'total_pins' => count($pins)
+        ], 3600);
+        
+        return $pins;
+    }
+    
+    private function get_camp_products($args = []) {
+        // Use native WooCommerce product query method
+        $defaults = [
+            'status' => 'publish',
+            'limit' => -1, // Get all products
+        ];
+        
+        $wc_args = wp_parse_args($args, $defaults);
+        
+        // Use WooCommerce's native product query - returns WC_Product objects
+        $wc_products = wc_get_products($wc_args);
+        
+        // Extract product IDs from WC_Product objects
+        $product_ids = [];
+        foreach ($wc_products as $wc_product) {
+            if ($wc_product && method_exists($wc_product, 'get_id')) {
+                $product_ids[] = $wc_product->get_id();
+            }
+        }
+        
+        return $product_ids;
+    }
+    
+    private function get_filtered_camps($season = [], $state = [], $min_price = 0, $max_price = 0, $sort = 'date-asc', $page = 1, $per_page = 12, $zip = '') {
+        // Use native WooCommerce product query
+        $wc_args = [
+            'status' => 'publish',
+            'limit' => $per_page,
+            'page' => $page,
+        ];
+        
+        // Category filtering (season) - use WooCommerce's category parameter
+        if (!empty($season) && is_array($season) && count($season) > 0) {
+            $category_ids = [];
+            foreach ($season as $season_slug) {
+                $term = get_term_by('slug', $season_slug, 'product_cat');
+                if ($term) {
+                    $category_ids[] = $term->term_id;
+                }
+            }
+            if (!empty($category_ids)) {
+                $wc_args['category'] = $category_ids;
+            }
+        }
+        
+        // State filtering - use meta_query for custom fields
+        if (!empty($state) && is_array($state) && count($state) > 0) {
+            $wc_args['meta_query'][] = [
+                'key' => 'ptp_event_state',
+                'value' => $state,
+                'compare' => 'IN',
+            ];
+        }
+        
+        // Price filtering using WooCommerce's min_price and max_price
+        if ($min_price > 0) {
+            $wc_args['min_price'] = floatval($min_price);
+        }
+        if ($max_price > 0) {
+            $wc_args['max_price'] = floatval($max_price);
+        }
+        
+        // Sorting using WooCommerce's orderby
+        switch ($sort) {
+            case 'date-asc':
+                $wc_args['orderby'] = 'meta_value';
+                $wc_args['meta_key'] = 'ptp_event_start';
+                $wc_args['order'] = 'ASC';
+                break;
+            case 'date-desc':
+                $wc_args['orderby'] = 'meta_value';
+                $wc_args['meta_key'] = 'ptp_event_start';
+                $wc_args['order'] = 'DESC';
+                break;
+            case 'price-asc':
+                $wc_args['orderby'] = 'price';
+                $wc_args['order'] = 'ASC';
+                break;
+            case 'price-desc':
+                $wc_args['orderby'] = 'price';
+                $wc_args['order'] = 'DESC';
+                break;
+            default:
+                $wc_args['orderby'] = 'menu_order';
+                $wc_args['order'] = 'ASC';
+        }
+        
+        // Get products using WooCommerce's native method
+        // wc_get_products() returns array of WC_Product objects, extract IDs
+        $wc_products = wc_get_products($wc_args);
+        $product_ids = [];
+        foreach ($wc_products as $wc_product) {
+            if ($wc_product && method_exists($wc_product, 'get_id')) {
+                $product_ids[] = $wc_product->get_id();
+            }
+        }
+        
+        $zip_coords = null;
+        
+        // If ZIP provided, calculate distances and sort by proximity
+        if (!empty($zip) && preg_match('/^\d{5}$/', $zip)) {
+            $zip_coords = $this->get_zip_coordinates($zip);
+            if ($zip_coords && !empty($product_ids) && is_array($product_ids)) {
+                // Calculate distances for each product
+                $products_with_distance = [];
+                foreach ($product_ids as $product_id) {
+                    $lat = get_post_meta($product_id, 'ptp_lat', true);
+                    $lng = get_post_meta($product_id, 'ptp_lng', true);
+                    
+                    if (!empty($lat) && !empty($lng)) {
+                        $distance = $this->calculate_distance(
+                            $zip_coords['lat'],
+                            $zip_coords['lng'],
+                            floatval($lat),
+                            floatval($lng)
+                        );
+                        $products_with_distance[] = [
+                            'id' => $product_id,
+                            'distance' => $distance,
+                        ];
+                    } else {
+                        // Products without location go to the end
+                        $products_with_distance[] = [
+                            'id' => $product_id,
+                            'distance' => 99999,
+                        ];
+                    }
+                }
+                
+                // Sort by distance
+                usort($products_with_distance, function($a, $b) {
+                    return $a['distance'] <=> $b['distance'];
+                });
+                
+                $product_ids = array_column($products_with_distance, 'id');
+            }
+        }
+        
+        $products = is_array($product_ids) ? $product_ids : [];
+        
+        // Get total count using WooCommerce query without pagination
+        $count_args = $wc_args;
+        $count_args['limit'] = -1;
+        $count_args['page'] = 1;
+        $all_wc_products = wc_get_products($count_args);
+        $total = is_array($all_wc_products) ? count($all_wc_products) : 0;
+        
+        // Calculate if there are more pages
+        $has_more = ($total > ($page * $per_page));
+        
+        return [
+            'products' => $products,
+            'total' => $total,
+            'has_more' => $has_more,
+        ];
+    }
+    
+    private function render_camp_card($product_id) {
+        $product = wc_get_product($product_id);
+        if (!$product) {
+            return '';
+        }
+        
+        // Batch get meta data in one call instead of multiple
+        $all_meta = get_post_meta($product_id);
+        $venue = isset($all_meta['ptp_event_venue_name'][0]) ? $all_meta['ptp_event_venue_name'][0] : '';
+        $city = isset($all_meta['ptp_event_city'][0]) ? $all_meta['ptp_event_city'][0] : '';
+        $state = isset($all_meta['ptp_event_state'][0]) ? $all_meta['ptp_event_state'][0] : '';
+        $start_date = isset($all_meta['ptp_event_start'][0]) ? $all_meta['ptp_event_start'][0] : '';
+        $end_date = isset($all_meta['ptp_event_end'][0]) ? $all_meta['ptp_event_end'][0] : '';
+        $age_band = isset($all_meta['ptp_age_band'][0]) ? $all_meta['ptp_age_band'][0] : '';
+        
+        // Get product image (optimized)
+        $image_id = $product->get_image_id();
+        $image_url = $image_id ? wp_get_attachment_image_url($image_id, 'medium_large') : wc_placeholder_img_src('medium_large');
+        // Image alt is stored on attachment, not product - use product name as fallback
+        $image_alt = $image_id ? get_post_meta($image_id, '_wp_attachment_image_alt', true) : '';
+        $image_alt = $image_alt ?: $product->get_name();
+        
+        // Format dates
+        $date_display = '';
+        if ($start_date) {
+            $date_format = 'M j, Y';
+            $start_formatted = date($date_format, strtotime($start_date));
+            if ($end_date && $end_date !== $start_date) {
+                $end_formatted = date($date_format, strtotime($end_date));
+                $date_display = $start_formatted . ' - ' . $end_formatted;
+            } else {
+                $date_display = $start_formatted;
+            }
+        }
+        
+        $location_display = trim(($city ? $city . ', ' : '') . ($state ? $state : ''));
+        
+        ob_start();
+        ?>
+        <article class="ptp-camp-card" itemscope itemtype="https://schema.org/Product">
+            <a href="<?php echo esc_url(get_permalink($product_id)); ?>" class="ptp-camp-card-link">
+                <div class="ptp-camp-card-image">
+                    <img 
+                        src="<?php echo esc_url($image_url); ?>" 
+                        alt="<?php echo esc_attr($image_alt); ?>"
+                        loading="lazy"
+                        width="400"
+                        height="300"
+                        itemprop="image"
+                    />
+                </div>
+                <div class="ptp-camp-card-content">
+                    <h3 class="ptp-camp-card-title" itemprop="name"><?php echo esc_html($product->get_name()); ?></h3>
+                    
+                    <?php if ($date_display): ?>
+                    <div class="ptp-camp-card-date">
+                        <span class="ptp-icon">📅</span>
+                        <?php echo esc_html($date_display); ?>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <?php if ($location_display): ?>
+                    <div class="ptp-camp-card-location">
+                        <span class="ptp-icon">📍</span>
+                        <?php echo esc_html($location_display); ?>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <?php if ($age_band): ?>
+                    <div class="ptp-camp-card-ages">
+                        <span class="ptp-icon">⚽</span>
+                        Ages <?php echo esc_html($age_band); ?>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <div class="ptp-camp-card-price" itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+                        <?php 
+                        $price_html = $product->get_price_html();
+                        if (!empty($price_html)) {
+                            echo $price_html;
+                        } else {
+                            echo '<span class="price">Price available on product page</span>';
+                        }
+                        ?>
+                        <meta itemprop="price" content="<?php echo esc_attr($product->get_price() ?: '0'); ?>">
+                        <meta itemprop="priceCurrency" content="USD">
+                    </div>
+                    
+                    <div class="ptp-camp-card-cta">
+                        <span class="ptp-cta-text">Register Now</span>
+                    </div>
+                </div>
+            </a>
+        </article>
+        <?php
+        return ob_get_clean();
+    }
+    
+    private function calculate_distance($lat1, $lng1, $lat2, $lng2) {
+        // Haversine formula to calculate distance in miles
+        $earth_radius = 3959; // miles
+        
+        $d_lat = deg2rad($lat2 - $lat1);
+        $d_lng = deg2rad($lng2 - $lng1);
+        
+        $a = sin($d_lat / 2) * sin($d_lat / 2) +
+             cos(deg2rad($lat1)) * cos(deg2rad($lat2)) *
+             sin($d_lng / 2) * sin($d_lng / 2);
+        
+        $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
+        
+        return $earth_radius * $c;
+    }
+    
+    private function get_zip_coordinates($zip) {
+        // Cache ZIP coordinates for 24 hours
+        $cache_key = 'ptp_zip_' . $zip;
+        $cached = get_transient($cache_key);
+        
+        if ($cached !== false) {
+            return $cached;
+        }
+        
+        // Use Google Geocoding API (server-side)
+        $api_key = get_option($this->api_key_option, '');
+        if (empty($api_key)) {
+            $api_key = $this->default_api_key;
+        }
+        if (empty($api_key)) {
+            return false;
+        }
+        
+        $url = 'https://maps.googleapis.com/maps/api/geocode/json?address=' . urlencode($zip) . '&key=' . urlencode($api_key);
+        $response = wp_remote_get($url, ['timeout' => 10]);
+        
+        if (is_wp_error($response)) {
+            return false;
+        }
+        
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body, true);
+        
+        if (!isset($data['results'][0]['geometry']['location'])) {
+            return false;
+        }
+        
+        $location = $data['results'][0]['geometry']['location'];
+        $coordinates = [
+            'lat' => floatval($location['lat']),
+            'lng' => floatval($location['lng']),
+        ];
+        
+        // Cache for 24 hours
+        set_transient($cache_key, $coordinates, DAY_IN_SECONDS);
+        
+        return $coordinates;
+    }
+    
+    private function get_inline_styles() {
+        return $this->get_css();
+    }
+    
+    private function get_inline_js() {
+        ob_start();
+        ?>
+        <script>
+        (function($) {
+            'use strict';
+            
+            let map = null;
+            let markers = [];
+            let geocoder = null;
+            let directionsService = null;
+            let directionsRenderer = null;
+            let userLocation = null;
+            let userZip = null;
+            
+            // Optimized initialization - wait for critical resources
+            let initialized = false;
+            
+            function safeInitialize() {
+                if (initialized) return;
+                if (typeof $ === 'undefined' || !$) return;
+                if (!$('#ptp-camp-finder').length) return;
+                
+                initialized = true;
+                initializeCampFinder();
+            }
+            
+            // Wait for DOM ready
+            if (typeof jQuery !== 'undefined') {
+                jQuery(function() {
+                    safeInitialize();
+                });
+            } else if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', safeInitialize);
+            } else {
+                // DOM already ready
+                safeInitialize();
+            }
+            
+            function initializeCampFinder() {
+                // Initialize video controls
+                initVideoControls();
+                
+                // Wait for Google Maps to load, then initialize map
+                if ($('#ptp-camps-map').length) {
+                    // Check if Google Maps is already loaded
+                    if (typeof google !== 'undefined' && google.maps && google.maps.Map) {
+                        initMap();
+                    } else {
+                        // Wait for Google Maps API to load (check for both our script and existing one)
+                        let checkCount = 0;
+                        const maxChecks = 100; // 10 seconds max
+                        
+                        const checkGoogle = setInterval(function() {
+                            checkCount++;
+                            if (typeof google !== 'undefined' && google.maps && google.maps.Map) {
+                                clearInterval(checkGoogle);
+                                initMap();
+                            } else if (checkCount >= maxChecks) {
+                                clearInterval(checkGoogle);
+                                if (!$('#ptp-camps-map').hasClass('initialized')) {
+                                    $('#ptp-map-loading').hide();
+                                    $('#ptp-map-error').show();
+                                }
+                            }
+                        }, 100);
+                    }
+                }
+                
+                // Use My Location functionality
+                $('#ptp-use-location-btn').on('click', function() {
+                    if (!navigator.geolocation) {
+                        alert('Geolocation is not supported by your browser.');
+                        return;
+                    }
+                    
+                    // Wait for map/geocoder to be ready
+                    if (!geocoder) {
+                        // Wait a bit for map to initialize
+                        setTimeout(function() {
+                            if (geocoder) {
+                                triggerLocationRequest();
+                            } else {
+                                alert('Map is still loading. Please try again in a moment.');
+                            }
+                        }, 1000);
+                    } else {
+                        triggerLocationRequest();
+                    }
+                });
+                
+                function triggerLocationRequest() {
+                    $('#ptp-use-location-btn').prop('disabled', true).text('📍 Finding location...');
+                    
+                    navigator.geolocation.getCurrentPosition(function(position) {
+                        const lat = position.coords.latitude;
+                        const lng = position.coords.longitude;
+                        userLocation = { lat: lat, lng: lng };
+                        
+                        if (geocoder) {
+                            geocoder.geocode({ location: { lat: lat, lng: lng } }, function(results, status) {
+                                if (status === 'OK' && results && results[0]) {
+                                    const zipComponent = results[0].address_components.find(function(component) {
+                                        return component.types && component.types.includes('postal_code');
+                                    });
+                                    
+                                    if (zipComponent) {
+                                        const zip = zipComponent.long_name;
+                                        userZip = zip;
+                                        $('#ptp-zip-search').val(zip);
+                                        centerMapOnZip(zip);
+                                        
+                                        // Scroll to camps section
+                                        $('html, body').animate({
+                                            scrollTop: $('#ptp-camps-section').offset().top - 20
+                                        }, 600);
+                                    }
+                                }
+                                
+                                $('#ptp-use-location-btn').prop('disabled', false).text('📍 Use My Location');
+                            });
+                        } else {
+                            $('#ptp-use-location-btn').prop('disabled', false).text('📍 Use My Location');
+                        }
+                    }, function(error) {
+                        alert('Unable to retrieve your location. Please enter your ZIP code manually.');
+                        $('#ptp-use-location-btn').prop('disabled', false).text('📍 Use My Location');
+                    });
+                }
+                
+                // ZIP search functionality
+                $('#ptp-find-camps-btn').on('click', function() {
+                    const zip = $('#ptp-zip-search').val().trim();
+                    
+                    if (!zip) {
+                        alert('Please enter a ZIP code');
+                        return;
+                    }
+                    
+                    if (!/^\d{5}$/.test(zip)) {
+                        alert('Please enter a valid 5-digit ZIP code');
+                        return;
+                    }
+                    
+                    userZip = zip;
+                    
+                    // Wait for map to be ready
+                    if (!map) {
+                        // Wait a bit for map to initialize
+                        setTimeout(function() {
+                            if (map) {
+                                centerMapOnZip(zip);
+                            } else {
+                                alert('Map is loading. Please try again in a moment.');
+                            }
+                        }, 1000);
+                    } else {
+                        centerMapOnZip(zip);
+                    }
+                    
+                    // Scroll to camps section
+                    $('html, body').animate({
+                        scrollTop: $('#ptp-camps-section').offset().top - 20
+                    }, 600);
+                });
+                
+                // Enter key on ZIP input
+                $('#ptp-zip-search').on('keypress', function(e) {
+                    if (e.which === 13) {
+                        $('#ptp-find-camps-btn').click();
+                    }
+                });
+                
+                // Smooth scroll for anchor links
+                $('a[href="#ptp-camps-section"]').on('click', function(e) {
+                    e.preventDefault();
+                    $('html, body').animate({
+                        scrollTop: $('#ptp-camps-section').offset().top - 20
+                    }, 600);
+                });
+            }
+            
+            function initVideoControls() {
+                const video = document.getElementById('ptp-hero-video');
+                if (!video) return;
+                
+                // Handle video load errors gracefully - don't block page
+                video.addEventListener('error', function(e) {
+                    // Silently hide video on error (500 errors won't break the page)
+                    video.style.display = 'none';
+                }, { once: true });
+                
+                // Lazy load video - only start loading when visible (performance optimization)
+                if ('IntersectionObserver' in window) {
+                    const videoObserver = new IntersectionObserver(function(entries) {
+                        entries.forEach(function(entry) {
+                            if (entry.isIntersecting && video.readyState === 0) {
+                                video.load();
+                                videoObserver.unobserve(video);
+                            }
+                        });
+                    }, { rootMargin: '50px' });
+                    videoObserver.observe(video);
+                } else {
+                    // Fallback for browsers without IntersectionObserver
+                    video.load();
+                }
+                
+                const playPauseBtn = $('#ptp-video-play-pause');
+                const soundBtn = $('#ptp-video-sound');
+                const playIcon = playPauseBtn.find('.ptp-icon-play');
+                const pauseIcon = playPauseBtn.find('.ptp-icon-pause');
+                const mutedIcon = soundBtn.find('.ptp-icon-muted');
+                const unmutedIcon = soundBtn.find('.ptp-icon-unmuted');
+                
+                // Play/Pause functionality
+                playPauseBtn.on('click', function() {
+                    if (video.paused) {
+                        video.play().then(function() {
+                            playIcon.hide();
+                            pauseIcon.show();
+                            playPauseBtn.attr('aria-label', 'Pause video');
+                        }).catch(function(err) {
+                            console.log('Video play error:', err);
+                        });
+                    } else {
+                        video.pause();
+                        pauseIcon.hide();
+                        playIcon.show();
+                        playPauseBtn.attr('aria-label', 'Play video');
+                    }
+                });
+                
+                // Sound toggle functionality
+                soundBtn.on('click', function() {
+                    if (video.muted) {
+                        video.muted = false;
+                        mutedIcon.hide();
+                        unmutedIcon.show();
+                        soundBtn.attr('aria-label', 'Mute video');
+                    } else {
+                        video.muted = true;
+                        unmutedIcon.hide();
+                        mutedIcon.show();
+                        soundBtn.attr('aria-label', 'Unmute video');
+                    }
+                });
+                
+                // Update icons based on video state
+                video.addEventListener('play', function() {
+                    playIcon.hide();
+                    pauseIcon.show();
+                });
+                
+                video.addEventListener('pause', function() {
+                    pauseIcon.hide();
+                    playIcon.show();
+                });
+                
+                // Handle video errors (especially on mobile)
+                video.addEventListener('error', function(e) {
+                    console.log('Video error:', e);
+                    // Fallback: show controls even if video fails
+                    playPauseBtn.prop('disabled', true);
+                    soundBtn.prop('disabled', true);
+                });
+                
+                // Optimize for mobile - pause video when user scrolls away
+                let isVideoVisible = true;
+                const observerOptions = {
+                    root: null,
+                    rootMargin: '0px',
+                    threshold: 0.3
+                };
+                
+                const videoObserver = new IntersectionObserver(function(entries) {
+                    entries.forEach(function(entry) {
+                        isVideoVisible = entry.isIntersecting;
+                        // On mobile, pause video when not visible to save resources
+                        if (window.innerWidth <= 768 && !isVideoVisible && !video.paused) {
+                            video.pause();
+                            pauseIcon.hide();
+                            playIcon.show();
+                        }
+                    });
+                }, observerOptions);
+                
+                if (video) {
+                    videoObserver.observe(video);
+                }
+                
+                // Pause video on mobile when page loses focus (e.g., user switches tabs)
+                if (window.innerWidth <= 768) {
+                    document.addEventListener('visibilitychange', function() {
+                        if (document.hidden && !video.paused) {
+                            video.pause();
+                            pauseIcon.hide();
+                            playIcon.show();
+                        }
+                    });
+                }
+            }
+            
+            function initMap() {
+                if (typeof google === 'undefined' || !google.maps) {
+                    $('#ptp-map-loading').hide();
+                    $('#ptp-map-error').show();
+                    return;
+                }
+                
+                const mapElement = document.getElementById('ptp-camps-map');
+                if (!mapElement) {
+                    return;
+                }
+                
+                if (mapElement.classList.contains('initialized')) {
+                    return; // Already initialized
+                }
+                
+                // Mark as initialized first to prevent double initialization
+                mapElement.classList.add('initialized');
+                
+                try {
+                    // Initialize services
+                    geocoder = new google.maps.Geocoder();
+                    directionsService = new google.maps.DirectionsService();
+                    directionsRenderer = new google.maps.DirectionsRenderer({
+                        suppressMarkers: false,
+                        map: null // Don't render on map by default
+                    });
+                    
+                    // Default center (Mid-Atlantic)
+                    map = new google.maps.Map(mapElement, {
+                        zoom: 7,
+                        center: { lat: 40.3573, lng: -74.6672 },
+                        mapTypeControl: false,
+                        streetViewControl: false,
+                        fullscreenControl: true,
+                    });
+                    
+                    loadMapPins();
+                } catch (error) {
+                    console.error('PTP: Error initializing map:', error);
+                    $('#ptp-map-loading').hide();
+                    $('#ptp-map-error').show();
+                }
+            }
+            
+            // Global callback for Google Maps async load (if needed)
+            window.initPTPMap = function() {
+                if ($('#ptp-camps-map').length && !map) {
+                    initMap();
+                }
+            };
+            
+            function loadMapPins() {
+                if (!map) {
+                    console.warn('PTP: loadMapPins called but map is not ready');
+                    setTimeout(function() {
+                        if (map) {
+                            loadMapPins();
+                        }
+                    }, 500);
+                    return;
+                }
+                
+                console.log('PTP: Loading map pins...');
+                
+                // Try REST API first, fallback to AJAX if REST fails
+                const restUrl = '<?php echo esc_js(home_url('/wp-json/ptp/v1/map-pins')); ?>';
+                const ajaxUrl = '<?php echo esc_js(admin_url('admin-ajax.php')); ?>';
+                
+                console.log('PTP: Trying REST API:', restUrl);
+                
+                // First try REST API with shorter timeout for faster failover
+                $.ajax({
+                    url: restUrl,
+                    method: 'GET',
+                    dataType: 'json',
+                    timeout: 5000,
+                    cache: true,
+                    success: function(pins) {
+                        console.log('PTP: REST API success, received', pins ? pins.length : 0, 'pins');
+                        handleMapPins(pins);
+                    },
+                    error: function(xhr, status, error) {
+                        console.warn('PTP: REST API failed:', xhr.status, status, error);
+                        
+                        // If REST API fails with 404, try AJAX fallback
+                        if (xhr.status === 404) {
+                            console.log('PTP: Trying AJAX fallback...');
+                            $.ajax({
+                                url: ajaxUrl,
+                                method: 'POST',
+                                dataType: 'json',
+                                data: {
+                                    action: 'ptp_get_map_pins',
+                                    nonce: '<?php echo wp_create_nonce('ptp_map_pins_nonce'); ?>'
+                                },
+                                timeout: 5000,
+                                cache: false,
+                                success: function(response) {
+                                    console.log('PTP: AJAX success, response:', response);
+                                    if (response && response.success && response.data) {
+                                        handleMapPins(response.data);
+                                    } else {
+                                        console.error('PTP: AJAX response invalid:', response);
+                                        $('#ptp-map-loading').hide();
+                                        $('#ptp-map-error').show().find('p').html('Unable to load camp locations.<br><br>Response: ' + JSON.stringify(response));
+                                    }
+                                },
+                                error: function(ajaxXhr, ajaxStatus, ajaxError) {
+                                    console.error('PTP: AJAX fallback failed:', ajaxStatus, ajaxError, ajaxXhr.responseText);
+                                    // Try GET request as fallback (public endpoint, no nonce)
+                                    console.log('PTP: Trying AJAX GET (public endpoint)...');
+                                    $.ajax({
+                                        url: ajaxUrl,
+                                        method: 'GET',
+                                        dataType: 'json',
+                                        data: {
+                                            action: 'ptp_get_map_pins'
+                                        },
+                                        timeout: 5000,
+                                        cache: false,
+                                        success: function(response) {
+                                            console.log('PTP: AJAX GET success, response:', response);
+                                            if (response && response.success && response.data) {
+                                                handleMapPins(response.data);
+                                            } else {
+                                                console.error('PTP: AJAX GET returned invalid data:', response);
+                                                $('#ptp-map-loading').hide();
+                                                $('#ptp-map-error').show().find('p').html('Unable to load camp locations. Products may not have location data set yet.<br><br>Response: ' + JSON.stringify(response));
+                                            }
+                                        },
+                                        error: function(getXhr, getStatus, getError) {
+                                            console.error('PTP: AJAX GET also failed:', getStatus, getError, getXhr.responseText);
+                                            $('#ptp-map-loading').hide();
+                                            $('#ptp-map-error').show().find('p').html('Unable to load camp locations from server.<br><br>Please:<br>1. Check PTP Camp Finder Settings to verify products have location data<br>2. Click "Clear Cache & Retry"<br>3. Verify products are published and have location information in descriptions or meta fields.');
+                                        }
+                                    });
+                                }
+                            });
+                        } else {
+                            $('#ptp-map-loading').hide();
+                            if (xhr.status !== 404 && xhr.status !== 0) {
+                                $('#ptp-map-error').show().find('p').html('Unable to load map pins. Status: ' + xhr.status + '<br><br>Check browser console (F12) for details.');
+                            }
+                        }
+                    }
+                });
+            }
+            
+            function calculateDistanceToPins(pins) {
+                // Skip if no user location or too many pins (API limit is 25 destinations per request)
+                if (!userLocation || !google.maps || !google.maps.DistanceMatrixService) {
+                    return;
+                }
+                
+                if (pins.length === 0) return;
+                
+                // Limit to 25 destinations per API call (Google's limit)
+                const maxDestinations = 25;
+                const pinsToProcess = pins.slice(0, maxDestinations);
+                
+                const destinations = pinsToProcess.map(function(pin) {
+                    return new google.maps.LatLng(pin.lat, pin.lng);
+                });
+                
+                const distanceMatrixService = new google.maps.DistanceMatrixService();
+                
+                // Use request throttling to avoid rate limits
+                distanceMatrixService.getDistanceMatrix({
+                    origins: [new google.maps.LatLng(userLocation.lat, userLocation.lng)],
+                    destinations: destinations,
+                    travelMode: 'DRIVING',
+                    unitSystem: google.maps.UnitSystem.IMPERIAL
+                }, function(response, status) {
+                    if (status === 'OK' && response && response.rows && response.rows[0]) {
+                        const elements = response.rows[0].elements;
+                        
+                        // Add distance info to pins and update markers
+                        pinsToProcess.forEach(function(pin, index) {
+                            if (elements[index] && elements[index].status === 'OK') {
+                                pin.distance = elements[index].distance.text;
+                                pin.duration = elements[index].duration.text;
+                                pin.distanceValue = elements[index].distance.value;
+                            }
+                        });
+                        
+                        // Sort pins by distance if we have distance data
+                        if (pinsToProcess.some(function(p) { return p.distanceValue; })) {
+                            pins.sort(function(a, b) {
+                                return (a.distanceValue || 999999) - (b.distanceValue || 999999);
+                            });
+                        }
+                        
+                        // Update info windows with distance info
+                        updateMarkersWithDistance(pins);
+                    }
+                });
+            }
+            
+            function updateMarkersWithDistance(pins) {
+                markers.forEach(function(marker, index) {
+                    const pin = pins[index];
+                    if (!pin) return;
+                    
+                    let infoContent = '<div style="padding: 10px; max-width: 280px;">';
+                    infoContent += '<h3 style="margin: 0 0 10px; font-size: 1.1rem; color: #0e0f11;">' + escapeHtml(pin.title) + '</h3>';
+                    
+                    if (pin.distance && pin.duration) {
+                        infoContent += '<p style="margin: 0 0 8px; color: #FCB900; font-weight: 600; font-size: 0.9rem;">📍 ' + pin.distance + ' away • ' + pin.duration + '</p>';
+                    }
+                    
+                    if (pin.address) {
+                        infoContent += '<p style="margin: 0 0 8px; color: #666; font-size: 0.9rem;">📍 ' + escapeHtml(pin.address) + '</p>';
+                    }
+                    
+                    if (pin.start_date) {
+                        infoContent += '<p style="margin: 0 0 10px; color: #666; font-size: 0.9rem;">📅 ' + formatDate(pin.start_date) + '</p>';
+                    }
+                    
+                    if (pin.price) {
+                        infoContent += '<p style="margin: 0 0 10px; font-weight: 700; color: #0e0f11;">' + pin.price + '</p>';
+                    }
+                    
+                    const mapsUrl = 'https://www.google.com/maps/search/?api=1&query=' + pin.lat + ',' + pin.lng;
+                    infoContent += '<div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px;">';
+                    infoContent += '<a href="' + escapeHtml(pin.permalink) + '" style="display: inline-block; padding: 8px 16px; background: #FCB900; color: #0e0f11; text-decoration: none; border-radius: 5px; font-weight: 600; font-size: 0.9rem;">View Details</a>';
+                    infoContent += '<a href="' + escapeHtml(mapsUrl) + '" target="_blank" style="display: inline-block; padding: 8px 16px; background: #0e0f11; color: #fff; text-decoration: none; border-radius: 5px; font-weight: 600; font-size: 0.9rem;">📍 Directions</a>';
+                    infoContent += '</div>';
+                    infoContent += '</div>';
+                    
+                    // Update or create info window
+                    const infoWindow = new google.maps.InfoWindow({
+                        content: infoContent
+                    });
+                    
+                    marker.infoWindow = infoWindow;
+                    
+                    marker.addListener('click', function() {
+                        // Close all other info windows
+                        markers.forEach(function(m) {
+                            if (m.infoWindow && m.infoWindow !== infoWindow) {
+                                m.infoWindow.close();
+                            }
+                        });
+                        infoWindow.open(map, marker);
+                    });
+                });
+            }
+            
+            function handleMapPins(pins) {
+                $('#ptp-map-loading').hide();
+                
+                console.log('PTP: handleMapPins called with:', pins ? pins.length : 0, 'pins');
+                console.log('PTP: Map object:', map ? 'exists' : 'missing');
+                
+                if (!map) {
+                    console.error('PTP: Map not initialized, cannot display pins');
+                    $('#ptp-map-error').show().find('p').html('Map is not ready. Please refresh the page.');
+                    return;
+                }
+                
+                if (!pins || pins.length === 0) {
+                    console.warn('PTP: No pins received. Products may not have addresses or coordinates.');
+                    $('#ptp-map-error').show().find('p').html('No camp locations found. Make sure your WooCommerce products have addresses in their descriptions (e.g., "123 Main St, City, ST 12345") or have ptp_lat/ptp_lng meta fields.<br><br><strong>Debug:</strong> Check your browser console (F12) for details.');
+                    return;
+                }
+                
+                // Validate pins have coordinates
+                const validPins = pins.filter(function(pin) {
+                    return pin && pin.lat && pin.lng && !isNaN(pin.lat) && !isNaN(pin.lng);
+                });
+                
+                if (validPins.length === 0) {
+                    console.error('PTP: No valid pins with coordinates found');
+                    $('#ptp-map-error').show().find('p').html('Pins received but none have valid coordinates. Check product data.');
+                    return;
+                }
+                
+                console.log('PTP: Creating', validPins.length, 'map markers');
+                
+                clearMarkers();
+                const bounds = new google.maps.LatLngBounds();
+                
+                validPins.forEach(function(pin, index) {
+                    try {
+                        const position = { lat: parseFloat(pin.lat), lng: parseFloat(pin.lng) };
+                        
+                        // Validate coordinates
+                        if (isNaN(position.lat) || isNaN(position.lng)) {
+                            console.warn('PTP: Invalid coordinates for pin', index, pin);
+                            return;
+                        }
+                        
+                        const marker = new google.maps.Marker({
+                            position: position,
+                            map: map,
+                            title: pin.title || 'Camp Location',
+                            icon: {
+                                path: google.maps.SymbolPath.CIRCLE,
+                                scale: 10,
+                                fillColor: '#FCB900',
+                                fillOpacity: 1,
+                                strokeColor: '#0e0f11',
+                                strokeWeight: 2,
+                            }
+                        });
+                        
+                        // Basic info window (will be updated with distance if available)
+                        const infoWindow = new google.maps.InfoWindow({
+                            content: '<div style="padding: 10px; max-width: 250px;"><h3 style="margin: 0 0 10px; font-size: 1.1rem;">' + escapeHtml(pin.title || 'Camp') + '</h3>' +
+                                     (pin.address ? '<p style="margin: 0 0 8px; color: #666; font-size: 0.9rem;">📍 ' + escapeHtml(pin.address) + '</p>' : '') +
+                                     (pin.start_date ? '<p style="margin: 0 0 10px; color: #666; font-size: 0.9rem;">📅 ' + formatDate(pin.start_date) + '</p>' : '') +
+                                     (pin.price ? '<p style="margin: 0 0 10px; font-weight: 700;">' + pin.price + '</p>' : '') +
+                                     '<a href="' + escapeHtml(pin.permalink || '#') + '" style="display: inline-block; padding: 8px 16px; background: #FCB900; color: #0e0f11; text-decoration: none; border-radius: 5px; font-weight: 600; font-size: 0.9rem;">View Details</a></div>'
+                        });
+                        
+                        marker.infoWindow = infoWindow;
+                        marker.pinData = pin;
+                        
+                        marker.addListener('click', function() {
+                            // Close all other info windows
+                            markers.forEach(function(m) {
+                                if (m.infoWindow && m.infoWindow !== infoWindow) {
+                                    m.infoWindow.close();
+                                }
+                            });
+                            infoWindow.open(map, marker);
+                        });
+                        
+                        markers.push(marker);
+                        bounds.extend(marker.getPosition());
+                        
+                        console.log('PTP: Created marker', index + 1, 'at', position.lat, position.lng);
+                    } catch (error) {
+                        console.error('PTP: Error creating marker for pin', index, error, pin);
+                    }
+                });
+                
+                console.log('PTP: Total markers created:', markers.length);
+                
+                // Calculate distances if user location is available
+                if (userLocation && markers.length > 0) {
+                    calculateDistanceToPins(validPins);
+                }
+                
+                // Adjust map bounds
+                if (markers.length > 0) {
+                    try {
+                        if (markers.length === 1 && userLocation) {
+                            // Center between user location and pin
+                            const center = new google.maps.LatLng(
+                                (userLocation.lat + markers[0].getPosition().lat()) / 2,
+                                (userLocation.lng + markers[0].getPosition().lng()) / 2
+                            );
+                            map.setCenter(center);
+                            map.setZoom(10);
+                        } else if (markers.length === 1) {
+                            map.setCenter(markers[0].getPosition());
+                            map.setZoom(12);
+                        } else {
+                            if (userLocation) {
+                                bounds.extend(new google.maps.LatLng(userLocation.lat, userLocation.lng));
+                            }
+                            map.fitBounds(bounds);
+                        }
+                        console.log('PTP: Map centered and zoomed successfully');
+                    } catch (error) {
+                        console.error('PTP: Error adjusting map bounds:', error);
+                    }
+                } else {
+                    console.warn('PTP: No markers to display on map');
+                }
+            }
+            
+            function clearMarkers() {
+                markers.forEach(function(marker) {
+                    marker.setMap(null);
+                });
+                markers = [];
+            }
+            
+            function centerMapOnZip(zip) {
+                if (!map) {
+                    // Wait for map to initialize
+                    setTimeout(function() {
+                        if (map) {
+                            centerMapOnZip(zip);
+                        }
+                    }, 500);
+                    return;
+                }
+                
+                // Ensure geocoder is initialized
+                if (!geocoder && typeof google !== 'undefined' && google.maps) {
+                    geocoder = new google.maps.Geocoder();
+                }
+                
+                if (!geocoder) {
+                    alert('Map services are still loading. Please try again in a moment.');
+                    return;
+                }
+                
+                const zipAddress = zip + ', USA';
+                
+                geocoder.geocode({ address: zipAddress }, function(results, status) {
+                    if (status === 'OK' && results && results[0]) {
+                        const location = results[0].geometry.location;
+                        userLocation = { lat: location.lat(), lng: location.lng() };
+                        
+                        map.setCenter(location);
+                        map.setZoom(10);
+                        
+                        // Reload pins and calculate distances
+                        loadMapPins();
+                    } else {
+                        alert('Could not find location for ZIP code ' + zip + '. Please try again.');
+                    }
+                });
+            }
+            
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+            
+            function formatDate(dateString) {
+                if (!dateString) return '';
+                const date = new Date(dateString);
+                return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            }
+            
+        })(jQuery);
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+    
+    private function get_css() {
+        ob_start();
+        ?>
+        <style id="ptp-camp-finder-styles">
+        :root {
+            --ptp-yellow: #FCB900;
+            --ptp-black: #0e0f11;
+            --ptp-gray: #6c757d;
+            --ptp-light-gray: #f8f9fa;
+            --ptp-white: #ffffff;
+            --ptp-border: #e9ecef;
+            --ptp-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            --ptp-radius: 8px;
+            --ptp-transition: all 0.3s ease;
+        }
+        
+        .ptp-camp-finder-container {
+            width: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        }
+        
+        /* Hero Section with Video */
+        .ptp-camp-finder-hero {
+            position: relative;
+            width: 100%;
+            min-height: 85vh;
+            max-height: 900px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--ptp-white);
+            padding: 80px 20px;
+            text-align: center;
+        }
+        
+        .ptp-hero-video {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            min-width: 100%;
+            min-height: 100%;
+            width: auto;
+            height: auto;
+            transform: translate(-50%, -50%);
+            z-index: 0;
+            object-fit: cover;
+            /* Mobile optimization */
+            max-width: none;
+            height: 100%;
+            width: 100%;
+        }
+        
+        /* Video Controls */
+        .ptp-video-controls {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            z-index: 10;
+            display: flex;
+            gap: 10px;
+            flex-direction: column;
+        }
+        
+        .ptp-video-btn {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: rgba(14, 15, 17, 0.8);
+            border: 2px solid rgba(252, 185, 0, 0.8);
+            color: var(--ptp-white);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            transition: var(--ptp-transition);
+            -webkit-backdrop-filter: blur(10px);
+            backdrop-filter: blur(10px);
+        }
+        
+        .ptp-video-btn:hover,
+        .ptp-video-btn:focus {
+            background: rgba(252, 185, 0, 0.9);
+            border-color: var(--ptp-white);
+            transform: scale(1.1);
+            outline: none;
+        }
+        
+        .ptp-video-btn:active {
+            transform: scale(0.95);
+        }
+        
+        .ptp-video-icon {
+            display: inline-block;
+            line-height: 1;
+        }
+        
+        .ptp-hero-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(14, 15, 17, 0.7), rgba(14, 15, 17, 0.5));
+            z-index: 1;
+        }
+        
+        .ptp-hero-content {
+            position: relative;
+            max-width: 900px;
+            width: 100%;
+            z-index: 2;
+        }
+        
+        .ptp-hero-title {
+            font-size: clamp(2.5rem, 6vw, 4rem);
+            font-weight: 800;
+            margin-bottom: 1rem;
+            line-height: 1.2;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        
+        .ptp-hero-subtitle {
+            font-size: clamp(1.2rem, 3vw, 1.8rem);
+            font-weight: 700;
+            color: var(--ptp-yellow);
+            margin-bottom: 1rem;
+        }
+        
+        .ptp-hero-description {
+            font-size: clamp(1rem, 2vw, 1.2rem);
+            margin-bottom: 2rem;
+            opacity: 0.95;
+            line-height: 1.6;
+        }
+        
+        .ptp-hero-search {
+            display: flex;
+            gap: 10px;
+            max-width: 600px;
+            margin: 0 auto 2rem;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        
+        .ptp-zip-input {
+            flex: 1;
+            min-width: 150px;
+            padding: 16px 20px;
+            border: 2px solid var(--ptp-white);
+            border-radius: 50px;
+            font-size: 1rem;
+            background: rgba(255, 255, 255, 0.95);
+            color: var(--ptp-black);
+        }
+        
+        .ptp-zip-input:focus {
+            outline: none;
+            border-color: var(--ptp-yellow);
+            background: var(--ptp-white);
+            box-shadow: 0 0 0 4px rgba(252, 185, 0, 0.2);
+        }
+        
+        .ptp-hero-btn {
+            padding: 16px 32px;
+            background: var(--ptp-yellow);
+            color: var(--ptp-black);
+            border: none;
+            border-radius: 50px;
+            font-size: 1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: var(--ptp-transition);
+            white-space: nowrap;
+        }
+        
+        .ptp-hero-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(252, 185, 0, 0.4);
+        }
+        
+        .ptp-location-btn {
+            background: rgba(255, 255, 255, 0.2);
+            color: var(--ptp-white);
+            border: 2px solid var(--ptp-white);
+            -webkit-backdrop-filter: blur(10px);
+            backdrop-filter: blur(10px);
+        }
+        
+        .ptp-location-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            border-color: var(--ptp-yellow);
+        }
+        
+        .ptp-location-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .ptp-scroll-indicator {
+            display: inline-block;
+            color: var(--ptp-white);
+            font-size: 2rem;
+            text-decoration: none;
+            animation: bounce 2s infinite;
+        }
+        
+        @keyframes bounce {
+            0%, 20%, 50%, 80%, 100% { transform: translateY(0); }
+            40% { transform: translateY(-10px); }
+            60% { transform: translateY(-5px); }
+        }
+        
+        /* Map Section */
+        .ptp-map-section {
+            background: var(--ptp-light-gray);
+            padding: 40px 0;
+        }
+        
+        .ptp-map-container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 20px;
+            position: relative;
+        }
+        
+        .ptp-map {
+            width: 100%;
+            height: 500px;
+            border-radius: var(--ptp-radius);
+            overflow: hidden;
+            box-shadow: var(--ptp-shadow);
+            background: #e5e3df;
+        }
+        
+        .ptp-map-loading,
+        .ptp-map-error {
+            text-align: center;
+            padding: 40px;
+            background: var(--ptp-white);
+            border-radius: var(--ptp-radius);
+            margin: 20px 0;
+        }
+        
+        /* Main Content */
+        .ptp-camps-main {
+            background: var(--ptp-white);
+        }
+        
+        .ptp-container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+        
+        /* List Header */
+        .ptp-list-header {
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        
+        .ptp-list-header h2 {
+            font-size: clamp(2rem, 4vw, 3rem);
+            font-weight: 800;
+            color: var(--ptp-black);
+            margin: 0;
+        }
+        
+        /* Camp Grid - Simplified List View */
+        .ptp-camps-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 30px;
+            margin-bottom: 40px;
+        }
+        
+        @media (min-width: 1200px) {
+            .ptp-camps-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+        }
+        
+        .ptp-camp-card {
+            background: var(--ptp-white);
+            border-radius: var(--ptp-radius);
+            overflow: hidden;
+            box-shadow: var(--ptp-shadow);
+            transition: var(--ptp-transition);
+            border: 1px solid var(--ptp-border);
+        }
+        
+        .ptp-camp-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+        }
+        
+        .ptp-camp-card-link {
+            text-decoration: none;
+            color: inherit;
+            display: block;
+        }
+        
+        .ptp-camp-card-image {
+            width: 100%;
+            height: 200px;
+            overflow: hidden;
+            background: var(--ptp-light-gray);
+        }
+        
+        .ptp-camp-card-image img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transition: var(--ptp-transition);
+        }
+        
+        .ptp-camp-card:hover .ptp-camp-card-image img {
+            transform: scale(1.05);
+        }
+        
+        .ptp-camp-card-content {
+            padding: 20px;
+        }
+        
+        .ptp-camp-card-title {
+            font-size: 1.3rem;
+            font-weight: 700;
+            margin-bottom: 15px;
+            color: var(--ptp-black);
+            line-height: 1.3;
+        }
+        
+        .ptp-camp-card-date,
+        .ptp-camp-card-location,
+        .ptp-camp-card-ages {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            color: var(--ptp-gray);
+            font-size: 0.95rem;
+        }
+        
+        .ptp-icon {
+            font-size: 1.1rem;
+        }
+        
+        .ptp-camp-card-price {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--ptp-black);
+            margin: 15px 0;
+        }
+        
+        .ptp-camp-card-cta {
+            margin-top: 15px;
+        }
+        
+        .ptp-cta-text {
+            display: inline-block;
+            padding: 12px 24px;
+            background: var(--ptp-black);
+            color: var(--ptp-white);
+            border-radius: var(--ptp-radius);
+            font-weight: 600;
+            transition: var(--ptp-transition);
+        }
+        
+        .ptp-camp-card:hover .ptp-cta-text {
+            background: var(--ptp-yellow);
+            color: var(--ptp-black);
+        }
+        
+        /* Load More */
+        .ptp-load-more-container {
+            text-align: center;
+            margin-top: 40px;
+        }
+        
+        .ptp-load-more-btn {
+            padding: 15px 40px;
+            background: var(--ptp-yellow);
+            color: var(--ptp-black);
+            border: none;
+            border-radius: 50px;
+            font-size: 1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: var(--ptp-transition);
+        }
+        
+        .ptp-load-more-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(252, 185, 0, 0.4);
+        }
+        
+        .ptp-no-results {
+            text-align: center;
+            padding: 60px 20px;
+            background: var(--ptp-light-gray);
+            border-radius: var(--ptp-radius);
+        }
+        
+        .ptp-no-results h3 {
+            font-size: 1.5rem;
+            margin-bottom: 10px;
+        }
+        
+        /* Responsive - Mobile Optimization */
+        @media (max-width: 768px) {
+            .ptp-camp-finder-hero {
+                min-height: 70vh;
+                max-height: 600px;
+                padding: 60px 15px 80px;
+            }
+            
+            .ptp-hero-video {
+                /* Optimize video for mobile - reduce quality on mobile */
+                object-position: center;
+            }
+            
+            .ptp-hero-title {
+                font-size: clamp(2rem, 8vw, 2.5rem);
+                margin-bottom: 0.75rem;
+            }
+            
+            .ptp-hero-subtitle {
+                font-size: clamp(1rem, 4vw, 1.3rem);
+                margin-bottom: 0.75rem;
+            }
+            
+            .ptp-hero-description {
+                font-size: clamp(0.9rem, 3vw, 1rem);
+                margin-bottom: 1.5rem;
+                line-height: 1.5;
+            }
+            
+            .ptp-hero-search {
+                flex-direction: column;
+                gap: 12px;
+            }
+            
+            .ptp-zip-input,
+            .ptp-hero-btn {
+                width: 100%;
+                padding: 14px 20px;
+                font-size: 1rem;
+            }
+            
+            .ptp-video-controls {
+                bottom: 15px;
+                right: 15px;
+                gap: 8px;
+            }
+            
+            .ptp-video-btn {
+                width: 44px;
+                height: 44px;
+                font-size: 18px;
+            }
+            
+            .ptp-map {
+                height: 350px;
+            }
+            
+            .ptp-container {
+                padding: 30px 15px;
+            }
+            
+            .ptp-camps-grid {
+                grid-template-columns: 1fr;
+                gap: 20px;
+            }
+            
+            .ptp-camp-card {
+                margin-bottom: 20px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .ptp-camp-finder-hero {
+                min-height: 60vh;
+                max-height: 500px;
+                padding: 40px 15px 70px;
+            }
+            
+            .ptp-video-controls {
+                bottom: 10px;
+                right: 10px;
+            }
+            
+            .ptp-video-btn {
+                width: 40px;
+                height: 40px;
+                font-size: 16px;
+            }
+            
+            .ptp-hero-content {
+                padding-top: 0;
+            }
+        }
+        
+        /* Accessibility */
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+        
+        /* Loading skeleton */
+        .ptp-camp-card.loading {
+            pointer-events: none;
+        }
+        
+        .ptp-camp-card.loading .ptp-camp-card-image {
+            background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+            background-size: 200% 100%;
+            animation: loading 1.5s infinite;
+        }
+        
+        @keyframes loading {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+        </style>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+// Initialize the plugin
+$ptp_camp_finder = new PTP_Camp_Finder();
+
+// Register REST routes immediately on plugin load (before WordPress fully initializes)
+add_action('plugins_loaded', function() use ($ptp_camp_finder) {
+    $ptp_camp_finder->register_rest_routes();
+}, 0);
+
+// Also register on init as fallback
+add_action('init', function() use ($ptp_camp_finder) {
+    $ptp_camp_finder->register_rest_routes();
+}, 0);
+
