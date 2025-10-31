@@ -1389,9 +1389,18 @@ simple,"Winter Soccer Clinic Alexandria VA January 18 2026",1,"Location: 123 Mai
         
         foreach ($product_ids as $product_id) {
             $wc_product = wc_get_product($product_id);
-            if (!$wc_product || !$wc_product->is_visible()) {
-                if (defined('WP_DEBUG') && WP_DEBUG && !$wc_product->is_visible()) {
-                    error_log("PTP: Product #{$product_id} is not visible, skipping");
+
+            if (!$wc_product) {
+                if (defined('WP_DEBUG') && WP_DEBUG) {
+                    error_log("PTP: Unable to load product #{$product_id}, skipping");
+                }
+                continue;
+            }
+
+            // Only skip products that are not published. Hidden catalog items should still appear on the map.
+            if (method_exists($wc_product, 'get_status') && 'publish' !== $wc_product->get_status()) {
+                if (defined('WP_DEBUG') && WP_DEBUG) {
+                    error_log("PTP: Product #{$product_id} has status '{$wc_product->get_status()}', skipping");
                 }
                 continue;
             }
